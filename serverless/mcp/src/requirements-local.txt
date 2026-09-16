@@ -1,0 +1,5 @@
+# Dependencies for running the server locally over stdio (python local_server.py).
+# Kept separate from requirements.txt so the `mcp` package is not bundled into the
+# Lambda deployment package, which does not need it.
+-r requirements.txt
+mcp>=1.2.0
