@@ -1,13 +1,21 @@
 """
 MWAA Serverless supported operators and YAML schema.
 
-Operators sourced from the official allowlist.
-Schema from the DAG YAML Schema (draft-07).
+Operators sourced from the official allowlist:
+https://docs.aws.amazon.com/mwaa/latest/mwaa-serverless-userguide/operators.html
+
+IMPORTANT: MWAA Serverless requires the FULLY QUALIFIED operator path in the
+`operator:` field. Short names (e.g. "S3ListOperator") are rejected by the
+service with: "Task 'x' 's operator 'S3ListOperator' is not supported".
+The short names in SUPPORTED_OPERATORS exist only so tooling can resolve a
+friendly name to the FQN that must be emitted.
 """
 
 SUPPORTED_OPERATORS = {
-    # ── Other ──
+    # ── Core / standard provider ──
     "EmptyOperator": "airflow.operators.empty.EmptyOperator",
+    "PythonOperator": "airflow.providers.standard.operators.python.PythonOperator",
+    "BashOperator": "airflow.providers.standard.operators.bash.BashOperator",
     # ── S3 ──
     "S3CreateBucketOperator": "airflow.providers.amazon.aws.operators.s3.S3CreateBucketOperator",
     "S3DeleteBucketOperator": "airflow.providers.amazon.aws.operators.s3.S3DeleteBucketOperator",
@@ -21,6 +29,21 @@ SUPPORTED_OPERATORS = {
     "S3ListPrefixesOperator": "airflow.providers.amazon.aws.operators.s3.S3ListPrefixesOperator",
     "S3KeySensor": "airflow.providers.amazon.aws.sensors.s3.S3KeySensor",
     "S3KeysUnchangedSensor": "airflow.providers.amazon.aws.sensors.s3.S3KeysUnchangedSensor",
+    # ── S3 Tables ──
+    "S3TablesCreateTableBucketOperator": "airflow.providers.amazon.aws.operators.s3_tables.S3TablesCreateTableBucketOperator",
+    "S3TablesCreateNamespaceOperator": "airflow.providers.amazon.aws.operators.s3_tables.S3TablesCreateNamespaceOperator",
+    "S3TablesCreateTableOperator": "airflow.providers.amazon.aws.operators.s3_tables.S3TablesCreateTableOperator",
+    "S3TablesDeleteTableBucketOperator": "airflow.providers.amazon.aws.operators.s3_tables.S3TablesDeleteTableBucketOperator",
+    "S3TablesDeleteNamespaceOperator": "airflow.providers.amazon.aws.operators.s3_tables.S3TablesDeleteNamespaceOperator",
+    "S3TablesDeleteTableOperator": "airflow.providers.amazon.aws.operators.s3_tables.S3TablesDeleteTableOperator",
+    # ── S3 Vectors ──
+    "S3VectorsCreateVectorBucketOperator": "airflow.providers.amazon.aws.operators.s3_vectors.S3VectorsCreateVectorBucketOperator",
+    "S3VectorsCreateIndexOperator": "airflow.providers.amazon.aws.operators.s3_vectors.S3VectorsCreateIndexOperator",
+    "S3VectorsDeleteIndexOperator": "airflow.providers.amazon.aws.operators.s3_vectors.S3VectorsDeleteIndexOperator",
+    "S3VectorsDeleteVectorBucketOperator": "airflow.providers.amazon.aws.operators.s3_vectors.S3VectorsDeleteVectorBucketOperator",
+    # ── MWAA Serverless (nested workflows) ──
+    "MwaaServerlessCreateWorkflowOperator": "airflow.providers.amazon.aws.operators.mwaa_serverless.MwaaServerlessCreateWorkflowOperator",
+    "MwaaServerlessStartWorkflowRunOperator": "airflow.providers.amazon.aws.operators.mwaa_serverless.MwaaServerlessStartWorkflowRunOperator",
     # ── Glue ──
     "GlueJobOperator": "airflow.providers.amazon.aws.operators.glue.GlueJobOperator",
     "GlueDataQualityOperator": "airflow.providers.amazon.aws.operators.glue.GlueDataQualityOperator",
@@ -33,6 +56,11 @@ SUPPORTED_OPERATORS = {
     "GlueDataQualityRuleRecommendationRunSensor": "airflow.providers.amazon.aws.sensors.glue.GlueDataQualityRuleRecommendationRunSensor",
     "GlueCatalogPartitionSensor": "airflow.providers.amazon.aws.sensors.glue_catalog_partition.GlueCatalogPartitionSensor",
     "GlueCrawlerSensor": "airflow.providers.amazon.aws.sensors.glue_crawler.GlueCrawlerSensor",
+    # ── Glue Data Catalog ──
+    "GlueCatalogCreateDatabaseOperator": "airflow.providers.amazon.aws.operators.glue_catalog.GlueCatalogCreateDatabaseOperator",
+    "GlueCatalogCreateTableOperator": "airflow.providers.amazon.aws.operators.glue_catalog.GlueCatalogCreateTableOperator",
+    "GlueCatalogDeleteDatabaseOperator": "airflow.providers.amazon.aws.operators.glue_catalog.GlueCatalogDeleteDatabaseOperator",
+    "GlueCatalogDeleteTableOperator": "airflow.providers.amazon.aws.operators.glue_catalog.GlueCatalogDeleteTableOperator",
     # ── Athena ──
     "AthenaOperator": "airflow.providers.amazon.aws.operators.athena.AthenaOperator",
     "AthenaSensor": "airflow.providers.amazon.aws.sensors.athena.AthenaSensor",
@@ -45,6 +73,9 @@ SUPPORTED_OPERATORS = {
     "BedrockIngestDataOperator": "airflow.providers.amazon.aws.operators.bedrock.BedrockIngestDataOperator",
     "BedrockRaGOperator": "airflow.providers.amazon.aws.operators.bedrock.BedrockRaGOperator",
     "BedrockRetrieveOperator": "airflow.providers.amazon.aws.operators.bedrock.BedrockRetrieveOperator",
+    "BedrockCreateGuardrailOperator": "airflow.providers.amazon.aws.operators.bedrock.BedrockCreateGuardrailOperator",
+    "BedrockCreateGuardrailVersionOperator": "airflow.providers.amazon.aws.operators.bedrock.BedrockCreateGuardrailVersionOperator",
+    "BedrockDeleteGuardrailOperator": "airflow.providers.amazon.aws.operators.bedrock.BedrockDeleteGuardrailOperator",
     "BedrockBaseSensor": "airflow.providers.amazon.aws.sensors.bedrock.BedrockBaseSensor",
     "BedrockCustomizeModelCompletedSensor": "airflow.providers.amazon.aws.sensors.bedrock.BedrockCustomizeModelCompletedSensor",
     "BedrockProvisionModelThroughputCompletedSensor": "airflow.providers.amazon.aws.sensors.bedrock.BedrockProvisionModelThroughputCompletedSensor",
@@ -234,8 +265,284 @@ SUPPORTED_OPERATORS = {
     "AwsBaseSensor": "airflow.providers.amazon.aws.sensors.base_aws.AwsBaseSensor",
 }
 
-# Reverse lookup: FQN -> short name
-_FQN_TO_SHORT = {v: k for k, v in SUPPORTED_OPERATORS.items()}
+# ── Alternate FQNs the service also accepts (verified) ──
+# Airflow 3 moved core operators into the "standard" provider but keeps the
+# legacy import paths working. Both forms are accepted by MWAA Serverless.
+ALT_OPERATOR_FQNS = {
+    "airflow.providers.standard.operators.empty.EmptyOperator": "EmptyOperator",
+    "airflow.operators.python.PythonOperator": "PythonOperator",
+    "airflow.operators.bash.BashOperator": "BashOperator",
+}
 
-# Set of all accepted operator values (both short names and FQNs)
-ALLOWED_OPERATOR_VALUES = set(SUPPORTED_OPERATORS.keys()) | set(SUPPORTED_OPERATORS.values())
+# ── Abstract base classes: in the allowlist but NOT usable as a task operator ──
+ABSTRACT_OPERATORS = {
+    "AwsBaseSensor", "EcsBaseOperator", "EcsBaseSensor", "EksBaseSensor",
+    "SageMakerBaseOperator", "SageMakerBaseSensor", "BedrockBaseSensor",
+    "EmrBaseSensor", "AppflowBaseOperator", "ComprehendBaseOperator",
+    "ComprehendBaseSensor", "RdsBaseOperator", "RdsBaseSensor",
+    "DmsTaskBaseSensor", "KinesisAnalyticsV2BaseSensor", "BatchOperatorBase",
+}
+
+# ── Operators that require code to be uploaded via the CreateWorkflow `Code` parameter ──
+CODE_OPERATORS = {"PythonOperator", "BashOperator"}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SENSOR COST CONTROL
+# ══════════════════════════════════════════════════════════════════════════
+# How a sensor waits matters, because MWAA Serverless bills for the time a task
+# occupies a worker. Two Airflow features look like they address this and currently
+# do not apply here:
+#
+#   mode: reschedule  Accepted and enum-validated at create time, but not supported
+#                     end to end — the wait does not resume. Leave sensors in the
+#                     default poke mode.
+#   deferrable: true  Accepted and then ignored; CreateWorkflow reports it under
+#                     Warnings: ['ignored attributes: deferrable'].
+#
+# Both are re-checked periodically against the live service; see SENSOR_MODE_SUPPORT
+# for the single place to update when that changes. Until then the lever is to wait
+# less rather than to wait differently: fewer sensors, bounded timeouts, and letting
+# an operator's own wait_for_completion block instead of adding a second task.
+SENSOR_MODES = ("poke", "reschedule")
+
+# Whether reschedule mode can be used. Flip this to True (and drop the message) once
+# the service supports it, and the validator, builder and repair paths follow.
+RESCHEDULE_MODE_SUPPORTED = False
+
+RESCHEDULE_MODE_UNSUPPORTED = (
+    "mode: reschedule is accepted at create time but is not currently supported end to "
+    "end on MWAA Serverless — the wait does not resume, so the task does not complete. "
+    "Use the default poke mode and bound it with a timeout."
+)
+
+# Sensor arguments the service accepts. `mode` is deliberately absent from the
+# defaults applied by the builder — see RESCHEDULE_MODE_SUPPORTED.
+SENSOR_COST_PARAMS = {
+    "poke_interval": "Seconds between checks. Lower means more API calls; it does not "
+                     "reduce cost, because the worker is held either way.",
+    "timeout": "Seconds (or a __type__ timedelta mapping) before the sensor gives up. "
+               "Airflow's default is 7 days, which on a billed platform is a real hazard.",
+    "soft_fail": "true to mark the task SKIPPED instead of FAILED on timeout.",
+    "exponential_backoff": "true to grow the interval between checks.",
+    "max_wait": "Upper bound on the interval when exponential_backoff is on.",
+}
+
+# Applied to sensors by the builder. Only a bounded wait — nothing that changes how
+# the task is scheduled, and nothing the caller did not ask for beyond safety.
+SENSOR_SAFETY_DEFAULTS = {"timeout": 3600}
+
+# Operators whose own blocking wait would otherwise tempt an author into adding a
+# second sensor task. Maps operator -> the sensor that would pair with it.
+LONG_WAIT_OPERATOR_PAIRS = {
+    "GlueJobOperator": "GlueJobSensor",
+    "GlueCrawlerOperator": "GlueCrawlerSensor",
+    "GlueDataQualityRuleSetEvaluationRunOperator": "GlueDataQualityRuleSetEvaluationRunSensor",
+    "AthenaOperator": "AthenaSensor",
+    "EmrCreateJobFlowOperator": "EmrJobFlowSensor",
+    "EmrAddStepsOperator": "EmrStepSensor",
+    "EmrServerlessStartJobOperator": "EmrServerlessJobSensor",
+    "EmrContainerOperator": "EmrContainerSensor",
+    "BatchOperator": "BatchSensor",
+    "StepFunctionStartExecutionOperator": "StepFunctionExecutionSensor",
+    "SageMakerTrainingOperator": "SageMakerTrainingSensor",
+    "SageMakerTransformOperator": "SageMakerTransformSensor",
+    "SageMakerTuningOperator": "SageMakerTuningSensor",
+    "SageMakerEndpointOperator": "SageMakerEndpointSensor",
+    "RdsCreateDbInstanceOperator": "RdsDbSensor",
+    "RedshiftCreateClusterOperator": "RedshiftClusterSensor",
+    "BedrockCustomizeModelOperator": "BedrockCustomizeModelCompletedSensor",
+    "BedrockIngestDataOperator": "BedrockIngestionJobSensor",
+}
+
+
+def is_sensor(operator: str) -> bool:
+    """True if the operator (short name or FQN) is a sensor.
+
+    Sensors are the only operators that accept `mode`, and the only ones where a
+    bounded `timeout` is a meaningful safety default.
+    """
+    if not operator:
+        return False
+    name = operator.rsplit(".", 1)[-1]
+    return name.endswith("Sensor")
+
+
+# ── Semantically required parameters per operator ──
+# MWAA Serverless only rejects a task at create time when the operator's Python
+# __init__ has a required positional arg. Many operators default their key
+# argument to None and then fail at RUN time — which is the single largest
+# source of "the DAG deployed but every task failed". These are validated
+# client-side so the problem surfaces before deployment.
+OPERATOR_REQUIRED_PARAMS = {
+    # Core
+    "PythonOperator": ["python_callable"],
+    "BashOperator": ["bash_command"],
+    # S3
+    "S3CreateBucketOperator": ["bucket_name"],
+    "S3DeleteBucketOperator": ["bucket_name"],
+    "S3CreateObjectOperator": ["s3_bucket", "s3_key", "data"],
+    "S3DeleteObjectsOperator": ["bucket"],
+    "S3ListOperator": ["bucket"],
+    "S3ListPrefixesOperator": ["bucket", "prefix", "delimiter"],
+    "S3CopyObjectOperator": ["source_bucket_key", "dest_bucket_key"],
+    "S3PutBucketTaggingOperator": ["bucket_name"],
+    "S3GetBucketTaggingOperator": ["bucket_name"],
+    "S3DeleteBucketTaggingOperator": ["bucket_name"],
+    "S3KeySensor": ["bucket_key"],
+    "S3KeysUnchangedSensor": ["bucket_name", "prefix"],
+    # Glue
+    "GlueJobOperator": ["job_name"],
+    "GlueJobSensor": ["job_name", "run_id"],
+    "GlueCrawlerOperator": ["config"],
+    "GlueCrawlerSensor": ["crawler_name"],
+    "GlueDataBrewStartJobOperator": ["job_name"],
+    "GlueDataQualityOperator": ["name", "ruleset"],
+    "GlueCatalogPartitionSensor": ["table_name"],
+    "GlueCatalogCreateDatabaseOperator": ["database_input"],
+    "GlueCatalogCreateTableOperator": ["table_input"],
+    "GlueCatalogDeleteDatabaseOperator": ["database_name"],
+    "GlueCatalogDeleteTableOperator": ["table_name"],
+    # Athena
+    "AthenaOperator": ["query", "database", "output_location"],
+    "AthenaSensor": ["query_execution_id"],
+    # Lambda
+    "LambdaInvokeFunctionOperator": ["function_name"],
+    "LambdaCreateFunctionOperator": ["function_name", "runtime", "role", "handler", "code"],
+    "LambdaFunctionStateSensor": ["function_name"],
+    # Step Functions
+    "StepFunctionStartExecutionOperator": ["state_machine_arn"],
+    "StepFunctionExecutionSensor": ["execution_arn"],
+    "StepFunctionGetExecutionOutputOperator": ["execution_arn"],
+    # Redshift
+    "RedshiftDataOperator": ["sql", "database"],
+    "RedshiftCreateClusterOperator": ["cluster_identifier", "node_type", "master_username", "master_user_password"],
+    "RedshiftDeleteClusterOperator": ["cluster_identifier"],
+    "RedshiftClusterSensor": ["cluster_identifier", "target_status"],
+    # EMR Serverless / EMR
+    "EmrServerlessCreateApplicationOperator": ["release_label", "job_type"],
+    "EmrServerlessStartJobOperator": ["application_id", "execution_role_arn", "job_driver"],
+    "EmrServerlessJobSensor": ["application_id", "job_run_id"],
+    "EmrServerlessDeleteApplicationOperator": ["application_id"],
+    "EmrServerlessStopApplicationOperator": ["application_id"],
+    "EmrAddStepsOperator": ["steps"],
+    "EmrCreateJobFlowOperator": ["job_flow_overrides"],
+    "EmrTerminateJobFlowOperator": ["job_flow_id"],
+    "EmrStepSensor": ["job_flow_id", "step_id"],
+    "EmrJobFlowSensor": ["job_flow_id"],
+    "EmrContainerOperator": ["virtual_cluster_id", "execution_role_arn", "release_label", "job_driver"],
+    # Batch / ECS / EKS
+    "BatchOperator": ["job_name", "job_definition", "job_queue"],
+    "BatchSensor": ["job_id"],
+    "EcsRunTaskOperator": ["task_definition", "cluster"],
+    "EcsRegisterTaskDefinitionOperator": ["family", "container_definitions"],
+    "EcsCreateClusterOperator": ["cluster_name"],
+    "EcsDeleteClusterOperator": ["cluster_name"],
+    "EksCreateClusterOperator": ["cluster_name", "cluster_role_arn", "resources_vpc_config"],
+    "EksDeleteClusterOperator": ["cluster_name"],
+    "EksPodOperator": ["cluster_name", "pod_name", "image"],
+    # Messaging
+    "SnsPublishOperator": ["target_arn", "message"],
+    "SqsPublishOperator": ["sqs_queue", "message_content"],
+    "SqsSensor": ["sqs_queue"],
+    "EventBridgePutEventsOperator": ["entries"],
+    # CloudFormation
+    "CloudFormationCreateStackOperator": ["stack_name", "cloudformation_parameters"],
+    "CloudFormationDeleteStackOperator": ["stack_name"],
+    "CloudFormationCreateStackSensor": ["stack_name"],
+    "CloudFormationDeleteStackSensor": ["stack_name"],
+    # Bedrock
+    "BedrockInvokeModelOperator": ["model_id", "input_data"],
+    "BedrockCustomizeModelOperator": ["job_name", "custom_model_name", "role_arn", "base_model_id"],
+    "BedrockRetrieveOperator": ["retrieval_query", "knowledge_base_id"],
+    # Other
+    "DynamoDBValueSensor": ["table_name", "partition_key_name", "partition_key_value", "attribute_name", "attribute_value"],
+    "QuickSightCreateIngestionOperator": ["data_set_id", "ingestion_id"],
+    "SageMakerTrainingOperator": ["config"],
+    "SageMakerProcessingOperator": ["config"],
+    "SageMakerTransformOperator": ["config"],
+    "SageMakerStartPipelineOperator": ["pipeline_name"],
+    "RdsCreateDbInstanceOperator": ["db_instance_identifier", "db_instance_class", "engine"],
+    "RdsDeleteDbInstanceOperator": ["db_instance_identifier"],
+    "RdsCreateDbSnapshotOperator": ["db_type", "db_identifier", "db_snapshot_identifier"],
+    "NeptuneStartDbClusterOperator": ["db_cluster_id"],
+    "NeptuneStopDbClusterOperator": ["db_cluster_id"],
+    "EC2CreateInstanceOperator": ["image_id"],
+    "EC2StartInstanceOperator": ["instance_id"],
+    "EC2StopInstanceOperator": ["instance_id"],
+    "EC2TerminateInstanceOperator": ["instance_ids"],
+    "GlacierCreateJobOperator": ["vault_name"],
+    "GlacierUploadArchiveOperator": ["vault_name", "body"],
+    "AppflowRunOperator": ["flow_name"],
+    "DmsCreateTaskOperator": ["replication_task_id", "source_endpoint_arn", "target_endpoint_arn",
+                              "replication_instance_arn", "table_mappings"],
+    "DmsStartTaskOperator": ["replication_task_arn"],
+    "DmsStopTaskOperator": ["replication_task_arn"],
+    "KinesisAnalyticsV2CreateApplicationOperator": ["application_name", "runtime_environment",
+                                                    "service_execution_role", "create_application_kwargs"],
+    "KinesisAnalyticsV2StartApplicationOperator": ["application_name"],
+    "ComprehendStartPiiEntitiesDetectionJobOperator": ["input_data_config", "output_data_config",
+                                                       "mode", "data_access_role_arn", "language_code"],
+    "S3TablesCreateTableBucketOperator": ["name"],
+    "S3TablesCreateNamespaceOperator": ["namespace", "table_bucket_arn"],
+    "S3TablesCreateTableOperator": ["namespace", "table_bucket_arn", "name", "format"],
+    "S3VectorsCreateVectorBucketOperator": ["vector_bucket_name"],
+    "S3VectorsCreateIndexOperator": ["vector_bucket_name", "index_name", "dimension",
+                                     "data_type", "distance_metric"],
+    "MwaaServerlessStartWorkflowRunOperator": ["workflow_arn"],
+}
+
+# ── What each operator pushes to XCom ──
+# Downstream tasks read these with {{ ti.xcom_pull(task_ids='<upstream>') }}.
+# This is how parameters are passed between tasks in MWAA Serverless — there is
+# no PythonOperator-free alternative for passing derived values.
+OPERATOR_XCOM_RETURNS = {
+    "GlueJobOperator": "str — the Glue job RUN ID. Feed to GlueJobSensor.run_id.",
+    "GlueCrawlerOperator": "str — the crawler name.",
+    "AthenaOperator": "str — the Athena query execution ID. Feed to AthenaSensor.query_execution_id.",
+    "S3ListOperator": "list[str] — matching object keys.",
+    "S3ListPrefixesOperator": "list[str] — matching prefixes.",
+    "S3GetBucketTaggingOperator": "list[dict] — bucket tag set.",
+    "LambdaInvokeFunctionOperator": "str — the function response payload (str). Use `| from_json` style parsing in Python code, not Jinja.",
+    "StepFunctionStartExecutionOperator": "str — the execution ARN. Feed to StepFunctionExecutionSensor.execution_arn.",
+    "StepFunctionGetExecutionOutputOperator": "dict — the state machine output.",
+    "EmrServerlessCreateApplicationOperator": "str — the EMR Serverless application ID.",
+    "EmrServerlessStartJobOperator": "str — the job run ID.",
+    "EmrCreateJobFlowOperator": "str — the EMR job flow (cluster) ID.",
+    "EmrAddStepsOperator": "list[str] — the added step IDs.",
+    "BatchOperator": "str — the Batch job ID.",
+    "EcsRunTaskOperator": "str — last log message, or the task ARN depending on config.",
+    "EcsRegisterTaskDefinitionOperator": "str — the task definition ARN.",
+    "RedshiftDataOperator": "str | list — statement ID, or rows when return_sql_result=True.",
+    "BedrockInvokeModelOperator": "dict — the model invocation response body.",
+    "PythonOperator": "Whatever the callable returns (must be JSON-serialisable, <= 100 KB).",
+    "BashOperator": "str — the last line of stdout.",
+    "SqsSensor": "list[dict] — the received messages.",
+    "CloudFormationCreateStackOperator": "None — CloudFormation stack outputs are NOT returned via XCom. "
+                                         "Do not try to read stack Outputs from XCom; pass known values as params instead.",
+}
+
+# Reverse lookup: FQN -> short name
+FQN_TO_SHORT = {v: k for k, v in SUPPORTED_OPERATORS.items()}
+FQN_TO_SHORT.update(ALT_OPERATOR_FQNS)
+_FQN_TO_SHORT = FQN_TO_SHORT  # backwards-compatible alias
+
+# Set of all operator values the SERVICE accepts (FQNs only).
+ALLOWED_OPERATOR_FQNS = set(SUPPORTED_OPERATORS.values()) | set(ALT_OPERATOR_FQNS.keys())
+
+# Every recognised spelling, including short names. Short names are recognised by
+# the tooling (so it can auto-correct them) but are NOT valid in deployed YAML.
+ALLOWED_OPERATOR_VALUES = set(SUPPORTED_OPERATORS.keys()) | ALLOWED_OPERATOR_FQNS
+
+
+def resolve_operator_fqn(operator: str):
+    """Return (fqn, short_name, was_short_name) for an operator string.
+
+    Returns (None, None, False) when the operator is not recognised at all.
+    """
+    if not isinstance(operator, str) or not operator:
+        return None, None, False
+    if operator in ALLOWED_OPERATOR_FQNS:
+        return operator, FQN_TO_SHORT.get(operator, operator.rsplit(".", 1)[-1]), False
+    if operator in SUPPORTED_OPERATORS:
+        return SUPPORTED_OPERATORS[operator], operator, True
+    return None, None, False

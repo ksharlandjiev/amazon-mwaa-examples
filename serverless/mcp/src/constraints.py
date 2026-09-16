@@ -1,11 +1,164 @@
 """
-MWAA Serverless supported Jinja template variables, macros, DAG/task parameters,
-and AWS base operator attributes.
+Amazon MWAA Serverless ground truth: YAML schema, Jinja support, DAG/task
+parameters, quotas, and DAG authoring policy.
 
-Source: https://docs.aws.amazon.com/mwaa/latest/mwaa-serverless-userguide/
+Sources:
+  - https://docs.aws.amazon.com/mwaa/latest/mwaa-serverless-userguide/
+  - Behaviour marked "verified" was confirmed empirically against the live
+    mwaa-serverless API (CreateWorkflow validation + real workflow runs).
+
+Where the documentation and the service disagree, the service wins and the
+discrepancy is called out explicitly.
 """
 
-# ── Supported Jinja template variables ──
+# ══════════════════════════════════════════════════════════════════════════
+#  THE YAML SCHEMA  (verified against the live service)
+# ══════════════════════════════════════════════════════════════════════════
+# This is the single most important section. Getting any of these wrong
+# produces a workflow that either fails CreateWorkflow validation or deploys
+# and then fails every task at run time.
+
+YAML_SCHEMA = {
+    "summary": (
+        "MWAA Serverless runs dag-factory 1.0.0. A definition file contains "
+        "EXACTLY ONE DAG. The root key is the dag_id. Tasks are a MAPPING keyed "
+        "by task_id. Operators must be FULLY QUALIFIED class paths. Operator "
+        "arguments are FLAT keys on the task — there is no 'parameters' wrapper. "
+        "Dependencies use the 'dependencies' key."
+    ),
+    "canonical_example": """my_pipeline:
+  description: "Crawl raw data, then query it"
+  schedule: "0 2 * * *"          # cron, "@daily", or null for manual-only
+  start_date: "2024-01-01"
+  max_active_runs: 1
+  default_args:
+    retries: 2
+    retry_delay: 60              # INTEGER SECONDS (0-300)
+  tasks:
+    crawl_raw:                   # task_id is the MAPPING KEY
+      operator: airflow.providers.amazon.aws.operators.glue_crawler.GlueCrawlerOperator
+      config:                    # operator kwargs are FLAT on the task
+        Name: my-crawler
+      wait_for_completion: true
+      execution_timeout:         # must be a timedelta MAPPING
+        __type__: datetime.timedelta
+        minutes: 30
+    run_query:
+      operator: airflow.providers.amazon.aws.operators.athena.AthenaOperator
+      query: "SELECT count(*) FROM my_db.my_table"
+      database: my_db
+      output_location: "s3://my-results-bucket/athena/"
+      dependencies: [crawl_raw]  # upstream task_ids
+    check_query:
+      operator: airflow.providers.amazon.aws.sensors.athena.AthenaSensor
+      # pass a value produced by an upstream task via XCom:
+      query_execution_id: "{{ ti.xcom_pull(task_ids='run_query') }}"
+      poke_interval: 60          # seconds between checks
+      timeout: 3600              # ALWAYS bound a wait; Airflow defaults to 7 days
+      dependencies: [run_query]
+""",
+    "rules": [
+        {
+            "rule": "Exactly one DAG per definition file.",
+            "verified": "Two root keys -> ValidationException: 'DAG definition should contain a single DAG'.",
+        },
+        {
+            "rule": "`tasks` MUST be a mapping keyed by task_id. A LIST of task objects is rejected.",
+            "verified": "A list -> ValidationException: 'Invalid tasks configuration.'",
+            "wrong": "tasks:\n  - task_id: a\n    operator: ...",
+            "right": "tasks:\n  a:\n    operator: ...",
+        },
+        {
+            "rule": "`operator` MUST be the fully qualified class path. Short names are rejected.",
+            "verified": "operator: S3ListOperator -> ValidationException: \"operator 'S3ListOperator' is not supported\".",
+            "wrong": "operator: S3ListOperator",
+            "right": "operator: airflow.providers.amazon.aws.operators.s3.S3ListOperator",
+        },
+        {
+            "rule": "Operator arguments are FLAT keys on the task. There is no `parameters:` wrapper.",
+            "verified": "Nesting under `parameters` -> ValidationException: \"missing keyword arguments 'data', 's3_key'\".",
+            "wrong": "task_a:\n  operator: <fqn>\n  parameters:\n    bucket: b",
+            "right": "task_a:\n  operator: <fqn>\n  bucket: b",
+        },
+        {
+            "rule": "Dependencies use `dependencies: [upstream_task_ids]`. `upstream_tasks` and `downstream_tasks` are NOT recognised.",
+            "verified": "upstream_tasks -> ValidationException: \"Invalid arguments were passed ... {'upstream_tasks': ['a']}\" "
+                        "(dag-factory forwards unknown keys straight to the operator constructor).",
+            "wrong": "upstream_tasks: [extract]",
+            "right": "dependencies: [extract]",
+        },
+        {
+            "rule": "`retry_delay` is an INTEGER number of seconds (0-300). Duration strings are rejected.",
+            "verified": "retry_delay: 30s -> ValidationException: 'unsupported type for timedelta seconds component: str'.",
+            "wrong": 'retry_delay: "5m"',
+            "right": "retry_delay: 300",
+        },
+        {
+            "rule": "`execution_timeout` MUST be a mapping with `__type__: datetime.timedelta` plus at least one "
+                    "timedelta field (weeks/days/hours/minutes/seconds/milliseconds/microseconds). Max 60 minutes.",
+            "verified": "Int -> 'execution_timeout must be timedelta object but passed as type: int'. "
+                        "String -> same with str. A bare mapping without __type__ -> same with dict. "
+                        "Over 60 min -> 'execution_timeout (66 minutes) must be less than or equal to 60 minutes'.",
+            "wrong": 'execution_timeout: "30m"',
+            "right": "execution_timeout:\n  __type__: datetime.timedelta\n  minutes: 30",
+        },
+        {
+            "rule": "`task_groups` is NOT supported.",
+            "verified": "ValidationException: 'my_dag.task_groups: Unexpected element'.",
+        },
+        {
+            "rule": "`default_args` accepts ONLY: owner, email, retries, retry_delay, priority_weight, "
+                    "end_date, execution_timeout, trigger_rule, start_date, wait_for_downstream. "
+                    "Any other key fails validation.",
+            "verified": "retry_delay_sec in default_args -> \"Key error - 'retry_delay_sec' not in (...)\".",
+        },
+        {
+            "rule": "`aws_conn_id`, `region_name`, `verify` and `botocore_config` are accepted but silently dropped. "
+                    "CreateWorkflow returns Warnings: ['ignored attributes: aws_conn_id']. Omit them.",
+            "verified": "Confirmed via the Warnings field on CreateWorkflow.",
+        },
+        {
+            "rule": "`trigger_rule` IS honoured at run time, despite being listed as unsupported in the "
+                    "'Task level parameters that are not supported' documentation table.",
+            "verified": "A task with trigger_rule: all_done downstream of a FAILED task did execute. "
+                        "It is also in the accepted default_args allowlist. Safe to use for cleanup tasks.",
+        },
+        {
+            "rule": "A past `start_date` is accepted, despite the docs saying it 'must be in the future'.",
+            "verified": "start_date: '2024-01-01' created successfully.",
+        },
+        {
+            "rule": "COST: `mode: reschedule` is accepted by CreateWorkflow but is not currently "
+                    "supported end to end — the wait does not resume, so the task never completes. "
+                    "Leave sensors in the default poke mode. `deferrable: true` is not an "
+                    "alternative either: it is accepted and then ignored, as there is no triggerer.",
+            "verified": "Create time: mode: reschedule -> ACCEPTED; mode: poke -> ACCEPTED; "
+                        "mode: nonsense -> \"The mode must be one of ['poke', 'reschedule']\". "
+                        "End to end: a poke-mode sensor completes normally; the same definition in "
+                        "reschedule mode does not.",
+        },
+        {
+            "rule": "COST: `mode` cannot go in `default_args` — it is not in the allowlist, so it must be "
+                    "set on each sensor task individually.",
+            "verified": "default_args: {mode: reschedule} -> \"Key error - 'mode' not in (...)\".",
+        },
+        {
+            "rule": "COST: `poke_interval`, `timeout`, `exponential_backoff`, `max_wait` and `soft_fail` "
+                    "are all accepted on sensors. Always set `timeout` — Airflow's default is 7 days "
+                    "and the worker is billed for the whole wait.",
+            "verified": "Each created successfully with no Warnings.",
+        },
+    ],
+}
+
+# Keys that dag-factory reserves and must not be used as operator arguments.
+DAG_FACTORY_RESERVED_KEYS = {"__type__", "__args__", "__join__", "__and__", "__or__"}
+
+# Task-level keys that are structural (consumed by dag-factory) rather than
+# forwarded to the operator constructor.
+TASK_STRUCTURAL_KEYS = {"operator", "dependencies", "task_id"}
+
+# ── Supported Jinja template variables (verified against docs) ──
 SUPPORTED_JINJA_VARIABLES = {
     "macros", "task_instance", "ti", "params",
     "ds", "ds_nodash", "ts", "ts_nodash",
@@ -18,35 +171,81 @@ SUPPORTED_MACROS = {
     "datetime_diff_for_humans", "ds_add", "ds_format", "random",
 }
 
-# ── DAG-level parameters validated by MWAA Serverless ──
+# Commonly attempted Jinja variables that do NOT exist in MWAA Serverless,
+# with the supported replacement.
+UNSUPPORTED_JINJA_REPLACEMENTS = {
+    "dag_run": "Not available. Use {{ params.* }} for configuration.",
+    "logical_date": "Not available directly. Use {{ ds }}, {{ ds_nodash }}, {{ ts }} or {{ ts_nodash }}.",
+    "execution_date": "Deprecated and unavailable. Use {{ ds }} / {{ ts }}.",
+    "data_interval_start": "Not available. Use {{ ds }} / {{ ts }}.",
+    "data_interval_end": "Not available. Use {{ ds }} / {{ ts }}.",
+    "next_ds": "Not available. Use {{ macros.ds_add(ds, 1) }}.",
+    "prev_ds": "Not available. Use {{ macros.ds_add(ds, -1) }}.",
+    "run_id": "Not available.",
+    "dag": "Not available.",
+    "conf": "Not available.",
+    "var": "Airflow Variables are not available. Use {{ params.* }}.",
+    "conn": "Airflow Connections are not available; credentials come from the execution role.",
+    "task": "Not available.",
+    "outlets": "Not available.",
+    "inlets": "Not available.",
+}
+
+# ── DAG-level parameters MWAA Serverless validates ──
 VALIDATED_DAG_PARAMS = {
-    "dag_id": "Must be a valid, non-empty string",
-    "schedule": "Must be a valid CRON expression format",
-    "start_date": "Must be in the future",
+    "schedule": "Cron expression, an @preset (@daily, @hourly, ...), or null for manual-only runs",
+    "start_date": "YYYY-MM-DD string. A past date is accepted in practice.",
     "end_date": "Must be after or equal to start_date",
-    "max_active_runs": "Must be smaller than account limit (default: 16)",
+    "max_active_runs": "Integer, must be below the account limit (default 16)",
+}
+
+# DAG-level keys accepted by the service (structural or validated).
+ACCEPTED_DAG_KEYS = {
+    "tasks", "params", "default_args", "schedule",
+    "start_date", "end_date", "max_active_runs", "max_active_tasks",
+}
+
+# Keys the service accepts without complaint but reports in the CreateWorkflow
+# `Warnings` list as "ignored attributes". Harmless, but they misrepresent what
+# actually runs, so the validator flags them. Verified via the Warnings field.
+SILENTLY_IGNORED_DAG_KEYS = {
+    "description": "The service reports 'ignored attributes: description'. It has no effect on the run.",
+    "max_active_runs": "The service reports 'ignored attributes: max_active_runs'. Per-workflow "
+                       "concurrency is governed by the account/workflow quota, not this field.",
+    "max_active_tasks": "Not applied — each task gets its own isolated worker.",
 }
 
 # ── DAG-level parameters ignored by MWAA Serverless ──
 IGNORED_DAG_PARAMS = {
-    "template_searchpath", "template_undefined", "user_defined_macros",
+    "dag_id", "template_searchpath", "template_undefined", "user_defined_macros",
     "user_defined_filters", "catchup", "access_control",
     "jinja_environment_kwargs", "render_template_as_native_obj", "tags",
     "owner_links", "auto_register", "fail_fast", "dag_display_name",
-    "depends_on_past", "email_on_failure", "email_on_retry", "description",
+    "depends_on_past", "email_on_failure", "email_on_retry",
     "max_consecutive_failed_dag_runs", "dagrun_timeout", "sla_miss_callback",
     "on_failure_callback", "on_success_callback", "is_paused_upon_creation",
+    "schedule_interval",
 }
 
-# ── Task-level parameters validated by MWAA Serverless ──
+# ── Task-level parameters MWAA Serverless validates ──
 VALIDATED_TASK_PARAMS = {
-    "task_id": "Must be a valid string",
-    "retries": "Must be between 0 and 3 (default: 1)",
-    "retry_delay": "Must be between 0 and 300 seconds (default: 300)",
-    "execution_timeout": "Maximum 3600 seconds (default: 3600)",
+    "task_id": "The mapping key. Must match ^[a-zA-Z0-9_.-]+$",
+    "retries": "Integer 0-3 (default 1)",
+    "retry_delay": "INTEGER SECONDS, 0-300 (default 300). Not a duration string.",
+    "execution_timeout": "Mapping: {__type__: datetime.timedelta, minutes: N}. Max 60 minutes.",
+}
+
+# ── `default_args` allowlist (verified — anything else fails validation) ──
+DEFAULT_ARGS_ALLOWLIST = {
+    "owner", "email", "retries", "retry_delay", "priority_weight",
+    "end_date", "wait_for_downstream", "execution_timeout",
+    "trigger_rule", "start_date",
 }
 
 # ── Task-level parameters ignored by MWAA Serverless ──
+# NOTE: `trigger_rule` and `deferrable` appear in the docs' unsupported table but
+# behave differently in practice — see YAML_SCHEMA["rules"]. They are handled
+# specially by the validator and deliberately excluded from this set.
 IGNORED_TASK_PARAMS = {
     "email_on_retry", "email_on_failure", "retry_exponential_backoff",
     "depends_on_past", "ignore_first_depends_on_past", "wait_for_downstream",
@@ -60,209 +259,439 @@ IGNORED_TASK_PARAMS = {
     "on_skipped_callback", "wait_for_past_depends_before_skipping",
     "do_xcom_push", "multiple_outputs", "start_date", "end_date",
     "weight_rule", "queue", "pool", "pool_slots", "pre_execute",
-    "post_execute", "executor", "task_group",
+    "post_execute", "executor", "task_group", "task_group_name",
 }
 
 # ── AWS base operator attributes ──
 AWS_BASE_OPERATOR_ATTRS = {
-    "aws_conn_id": "Controlled by service (do not set)",
-    "verify": "Not supported",
-    "botocore_config": "Not supported",
-    "region_name": "Gets region from environment (do not set)",
+    "aws_conn_id": "Controlled by the service. Accepted but dropped (CreateWorkflow returns an 'ignored attributes' warning).",
+    "verify": "Not supported. Accepted but dropped.",
+    "botocore_config": "Not supported. Accepted but dropped.",
+    "region_name": "Taken from the workflow's Region. Accepted but dropped.",
 }
 
-# Features explicitly NOT supported
+# ── Features explicitly NOT supported ──
 UNSUPPORTED_FEATURES = [
-    "Deferrable operators (deferrable=True)",
-    "Dynamic task mapping (.expand() / .map())",
-    "PythonOperator / BashOperator / any non-Amazon provider operator",
-    "Decorated tasks (@task, @task.python, @task.bash)",
-    "Decorated DAGs (@dag)",
-    "TaskFlow API",
-    "aws_conn_id (controlled by service)",
-    "verify / botocore_config / region_name on operators",
+    "Dynamic task mapping (.expand() / .expand_kwargs() / .map())",
+    "Task groups (task_groups is rejected: 'Unexpected element')",
+    "Decorated tasks and DAGs (@task, @task.python, @task.bash, @dag) — the TaskFlow API",
+    "Operators outside the allowlist, including any non-Amazon, non-standard provider operator",
+    "Airflow Variables, Connections and Pools",
+    "Multiple DAGs in one definition file",
+    "Direct Airflow UI access (monitor via CloudWatch Logs)",
+    "verify / botocore_config / region_name / aws_conn_id on operators",
 ]
 
-# ── MWAA Serverless API actions ──
-# Service name: mwaa-serverless (NOT mwaa, which is classic/provisioned MWAA)
-MWAA_API_ACTIONS = {
-    "service_name": "mwaa-serverless",
-    "cli_prefix": "aws mwaa-serverless",
-    "workflow_management": {
-        "actions": [
-            "CreateWorkflow",
-            "DeleteWorkflow",
-            "GetWorkflow",
-            "ListWorkflows",
-            "ListWorkflowVersions",
-            "UpdateWorkflow",
-            "StartWorkflowRun",
-            "StopWorkflowRun",
-            "ListTagsForResource",
-            "TagResource",
-            "UntagResource",
-        ],
-    },
+# Previously unsupported, now available — call this out so guidance stays current.
+RECENTLY_ADDED_FEATURES = {
+    "python_and_bash_operators": (
+        "PythonOperator and BashOperator ARE now supported. Earlier guidance that said "
+        "'no Python/Bash operators' is out of date. They run custom code that you upload "
+        "separately via the CreateWorkflow/UpdateWorkflow `Code` parameter. See CODE_SUPPORT."
+    ),
 }
 
-# ── Service overview (educates the LLM about how MWAA Serverless works) ──
+# ══════════════════════════════════════════════════════════════════════════
+#  PYTHON / BASH OPERATOR CODE SUPPORT
+# ══════════════════════════════════════════════════════════════════════════
+CODE_SUPPORT = {
+    "operators": {
+        "PythonOperator": {
+            "fqn": "airflow.providers.standard.operators.python.PythonOperator",
+            "legacy_fqn": "airflow.operators.python.PythonOperator",
+            "required_param": "python_callable",
+            "value_format": "module_name.function_name (e.g. 'transform.clean_rows'). "
+                            "NOT a lambda, not an inline def, and not a bare function name.",
+        },
+        "BashOperator": {
+            "fqn": "airflow.providers.standard.operators.bash.BashOperator",
+            "legacy_fqn": "airflow.operators.bash.BashOperator",
+            "required_param": "bash_command",
+            "value_format": "A shell command string, or './script.sh' for a script in the code bundle.",
+        },
+    },
+    "how_code_is_delivered": (
+        "The YAML definition and the code are two SEPARATE S3 objects. The YAML goes in "
+        "DefinitionS3Location; the code goes in Code.S3Location. Both are snapshotted "
+        "into an immutable workflow version on create/update."
+    ),
+    "accepted_code_files": [
+        "a single .py file",
+        "a single .sh script",
+        "a .zip archive with all modules and dependencies at the ARCHIVE ROOT (no nested folders)",
+    ],
+    "worker_environment": {
+        "os_arch": "Linux / x86_64",
+        "cpu_memory": "1 vCPU / 3 GiB per task",
+        "python": "3.12",
+        "code_extracted_to": "/usr/local/airflow/dags (also the BashOperator working directory)",
+        "credentials": "The workflow execution role is resolved automatically by boto3. Do not embed credentials.",
+    },
+    "preinstalled_packages": {
+        "apache-airflow": "3.0.6",
+        "apache-airflow-providers-amazon": "9.32.0",
+        "boto3": "1.43.1",
+        "botocore": "1.43.1",
+        "dag-factory": "1.0.0",
+        "pyyaml": "unpinned",
+        "lz4": "4.4.4",
+    },
+    "packaging_dependencies": (
+        "pip install -r requirements.txt --target ./pkg --platform manylinux2014_x86_64 "
+        "--python-version 3.12 --only-binary=:all:  then  (cd pkg && zip -r ../code.zip . "
+        "-x '*__pycache__*' '*.pyc'). Pre-installed packages take precedence over bundled "
+        "copies, so do not bundle boto3 or airflow."
+    ),
+    "limits": {
+        "max_code_size": "250 MB (compressed file and uncompressed archive)",
+        "code_storage_per_account": "75 GB",
+    },
+    "no_internet_by_default": (
+        "Python and Bash tasks have NO internet access unless you attach a VPC with egress "
+        "via NetworkConfiguration. They can reach S3, ECR and CloudWatch. Calls to third-party "
+        "APIs will hang or fail — stage that data in S3 first."
+    ),
+    "when_to_use": (
+        "Use a native AWS operator whenever one exists — it is simpler, needs no code bundle, "
+        "and is easier to debug. Reach for PythonOperator only for genuine glue logic: "
+        "reshaping an upstream XCom value, branching on a computed condition, or calling an "
+        "AWS API that has no operator."
+    ),
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PASSING VALUES BETWEEN TASKS
+# ══════════════════════════════════════════════════════════════════════════
+PARAMETER_PASSING = {
+    "mechanism": (
+        "Tasks exchange values through XCom. An operator's return value is pushed "
+        "automatically; a downstream task reads it with a Jinja reference: "
+        "{{ ti.xcom_pull(task_ids='<upstream_task_id>') }}"
+    ),
+    "rules": [
+        "The task you pull from MUST also be listed in `dependencies`, otherwise it may not "
+        "have run yet and the pull returns None.",
+        "XCom values are capped at 100 KB. Pass an S3 URI, not the data itself.",
+        "Jinja renders to a STRING. Indexing works ({{ ti.xcom_pull(task_ids='x')['id'] }}) but "
+        "arithmetic and type coercion do not — do that in a PythonOperator.",
+        "Only templated operator fields render Jinja. Check the operator's template_fields "
+        "before relying on a Jinja reference in an unusual field.",
+        "CloudFormationCreateStackOperator does NOT return stack outputs via XCom. Do not "
+        "attempt to read Outputs[n].OutputValue from it — pass concrete values as params instead.",
+    ],
+    "worked_example": """# Verified working: Glue job -> sensor -> Athena
+tasks:
+  transform:
+    operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+    job_name: "{{ params.glue_job_name }}"
+    wait_for_completion: false          # return immediately, sensor waits
+  wait_transform:
+    operator: airflow.providers.amazon.aws.sensors.glue.GlueJobSensor
+    job_name: "{{ params.glue_job_name }}"
+    run_id: "{{ ti.xcom_pull(task_ids='transform') }}"   # <- run ID from XCom
+    dependencies: [transform]
+""",
+    "python_example": """# In your code bundle (transform.py):
+def summarise(**context):
+    keys = context["ti"].xcom_pull(task_ids="list_input")   # read upstream
+    return {"count": len(keys), "first": keys[0] if keys else None}
+
+# In the YAML:
+tasks:
+  summarise:
+    operator: airflow.providers.standard.operators.python.PythonOperator
+    python_callable: transform.summarise
+    dependencies: [list_input]
+  report:
+    operator: airflow.providers.amazon.aws.operators.sns.SnsPublishOperator
+    target_arn: "{{ params.topic_arn }}"
+    message: "processed {{ ti.xcom_pull(task_ids='summarise')['count'] }} files"
+    dependencies: [summarise]
+""",
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  QUOTAS
+# ══════════════════════════════════════════════════════════════════════════
+QUOTAS = {
+    "max_workflows_per_account": 100,
+    "max_versions_per_workflow": 50,
+    "max_concurrent_runs_per_account": 100,
+    "max_concurrent_runs_per_workflow": 20,
+    "max_xcom_kb": 100,
+    "max_dag_definition_kb": 50,
+    "max_code_storage_gb": 75,
+    "max_task_execution_timeout_minutes": 60,
+    "max_retries_per_task": 3,
+    "max_retry_delay_seconds": 300,
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DAG AUTHORING POLICY
+# ══════════════════════════════════════════════════════════════════════════
+# The failure mode this policy exists to prevent: an agent asked for "a DAG that
+# runs two Glue jobs and an Athena query" produces forty tasks that provision
+# CloudFormation stacks, publish SNS alerts and emit CloudWatch metrics, none of
+# which was requested and most of which does not run.
+
+AUTHORING_POLICY = {
+    "scope_discipline": {
+        "principle": "Build exactly what was asked for. Nothing else.",
+        "rules": [
+            "One task per operation the user actually named. Do not invent extra steps.",
+            "Do NOT add monitoring, alerting, notification, metric-publishing, logging or "
+            "audit tasks unless the user asked for them.",
+            "Do NOT add CloudFormation provisioning unless the user asked you to create the "
+            "underlying infrastructure. Assume named resources (Glue jobs, crawlers, "
+            "databases, buckets) already exist and reference them via params.",
+            "Do NOT add cleanup/teardown tasks unless the DAG itself created the resource.",
+            "Do NOT add sensors that duplicate an operator's own wait_for_completion behaviour.",
+        ],
+    },
+    "gentle_prompting": {
+        "principle": (
+            "When a best practice is missing from the request, do not silently add it and do "
+            "not silently omit it. Build the minimal DAG, then tell the user what you left out "
+            "and ask whether they want it."
+        ),
+        "how_to_phrase": (
+            "State the DAG you built, then: 'I kept this to what you asked for. A few things "
+            "you may want to add: (1) ... (2) ... Want me to include any of these?'"
+        ),
+        "candidates_to_offer": [
+            "Failure notification (SnsPublishOperator with trigger_rule: one_failed)",
+            "Retries and per-task execution_timeout, if the defaults are not appropriate",
+            "A data-quality gate (GlueDataQualityOperator) between transform and consume steps",
+            "A crawler run after a write, so the Glue Catalog reflects new partitions",
+            "An S3KeySensor at the start, if the pipeline depends on an upstream file landing",
+            "A schedule, if the user did not specify one (the DAG is manual-only without it)",
+            "max_active_runs: 1, if the pipeline is not safe to run concurrently",
+        ],
+        "must_ask_when_unknown": [
+            "Resource identifiers the DAG cannot work without: Glue job names, crawler names, "
+            "database and table names, bucket names, Athena output location, role ARNs.",
+            "Whether named resources already exist, or the DAG should create them.",
+            "The schedule.",
+            "Whether a step should block on completion, or fire and continue.",
+        ],
+        "never_do": [
+            "Never invent a plausible-looking ARN, bucket name or account ID. Use a "
+            "{{ params.x }} reference with an obviously-placeholder default, and tell the user "
+            "it needs replacing.",
+        ],
+    },
+    "cost_efficiency": {
+        "principle": (
+            "MWAA Serverless bills for the time a task occupies a worker. A task that spends "
+            "20 minutes sleeping in a poll loop costs the same as 20 minutes of real work. "
+            "Waiting should therefore be done in a way that releases the worker."
+        ),
+        "neither_wait_mechanism_is_available": (
+            "Airflow offers two ways to wait without holding a worker and neither applies on MWAA "
+            "Serverless today. mode: reschedule is accepted by CreateWorkflow and enum-checked, but "
+            "is not supported end to end: the wait does not resume, so the task never completes. "
+            "deferrable: true is accepted and then ignored, because there is no triggerer. Both are "
+            "checked against the live service; see schema.RESCHEDULE_MODE_SUPPORTED."
+        ),
+        "deferrable_does_not_work": (
+            "deferrable: true is the usual Airflow answer and it does not apply here. MWAA "
+            "Serverless has no triggerer: CreateWorkflow accepts the argument and returns "
+            "Warnings: ['ignored attributes: deferrable'], then runs the task in blocking mode "
+            "anyway. mode: reschedule is not a substitute — it is unavailable too."
+        ),
+        "so_the_real_lever_is_to_wait_less": (
+            "Since every wait is billed as worker time regardless of how it is expressed, reduce "
+            "the amount of waiting rather than trying to make waiting cheap."
+        ),
+        "rules": [
+            "Leave sensors in the default poke mode. Do not set mode: reschedule — it is not "
+            "supported end to end, so the task never completes.",
+            "ALWAYS set a timeout on a sensor. Airflow's default is 7 days, and the worker is "
+            "held for the whole wait, so an unbounded wait is an unbounded bill.",
+            "Prefer ONE operator with wait_for_completion: true over an operator plus a sensor. "
+            "The blocking wait costs the same as the sensor would, and it is one task instead of "
+            "two. Split them only for independent retries or genuine parallelism.",
+            "Do not add a sensor that duplicates an operator's own wait.",
+            "poke_interval changes API call volume, not cost. There is no need to tune it for "
+            "spend; 60s is a fine default.",
+            "Push long waits into the service being orchestrated where you can — a Glue job that "
+            "polls its own dependency costs Glue time, not Airflow worker time.",
+            "exponential_backoff: true with max_wait is accepted and reduces API chatter on an "
+            "unpredictable wait.",
+            "mode cannot be set in default_args (not in the allowlist) — which is moot, since it "
+            "should not be set at all.",
+        ],
+        "when_reschedule_becomes_available": (
+            "mode: reschedule would become the primary lever: the task exits between checks and "
+            "releases the worker. Re-test a multi-poke wait end to end, then flip "
+            "schema.RESCHEDULE_MODE_SUPPORTED."
+        ),
+    },
+    "correctness_checklist": [
+        "Every task's operator is a fully qualified path from the allowlist.",
+        "`tasks` is a mapping, not a list.",
+        "Operator arguments are flat on the task; there is no `parameters:` block.",
+        "Dependencies use `dependencies:`; the graph is acyclic and every referenced task exists.",
+        "Every semantically required operator argument is present.",
+        "Every `ti.xcom_pull(task_ids='X')` names a task that is also in that task's `dependencies`.",
+        "retry_delay is an integer; execution_timeout is a __type__ timedelta mapping under 60 minutes.",
+        "No aws_conn_id / region_name / verify / botocore_config.",
+        "Cleanup tasks (only for resources this DAG created) set trigger_rule: all_done.",
+        "Every sensor sets a timeout, and no sensor sets mode: reschedule.",
+        "The definition is under 50 KB.",
+    ],
+    "best_practices": [
+        "Parameterise every environment-specific value with {{ params.x }} and give it a default.",
+        "Prefer one operator that waits (wait_for_completion: true) over an operator plus a "
+        "sensor. The wait is billed as worker time either way, so the split adds a task start "
+        "without saving anything. Split only for independent retries or real parallelism.",
+        "Always bound a sensor with a timeout, and leave it in the default poke mode. See the "
+        "cost_efficiency policy for why reschedule mode is not an option here.",
+        "Set max_active_runs: 1 for pipelines that write to a shared destination.",
+        "Keep retries low (0-3) and retry_delay short; MWAA Serverless caps both.",
+        "Put the long tail of work in the service being orchestrated (Glue, EMR, Athena), not "
+        "in PythonOperator tasks — each task gets 1 vCPU / 3 GiB and a 60 minute ceiling.",
+        "Name tasks after what they do (crawl_raw_events, not task_1).",
+    ],
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  API / CLI
+# ══════════════════════════════════════════════════════════════════════════
+MWAA_API_ACTIONS = {
+    "service_name": "mwaa-serverless",
+    "boto3_client": "mwaa-serverless (requires boto3 >= 1.40 for the `Code` parameter; "
+                    "older botocore registers the service as 'airflow-serverless' without Code support)",
+    "iam_action_prefix": "airflow-serverless:",
+    "cli_prefix": "aws mwaa-serverless",
+    "create_workflow_params": {
+        "Name": "required",
+        "DefinitionS3Location": "required — {Bucket, ObjectKey, VersionId?}",
+        "RoleArn": "required — NOT 'ExecutionRoleArn'",
+        "Code": "optional — {S3Location: {Bucket, ObjectKey, VersionId?}}. Required for Python/Bash tasks.",
+        "TriggerMode": "optional — SCHEDULED | MANUAL | DISABLED",
+        "LoggingConfiguration": "optional — {LogGroupName}",
+        "NetworkConfiguration": "optional — {SubnetIds, SecurityGroupIds} for VPC access",
+        "EncryptionConfiguration": "optional — {Type, KmsKeyId}",
+        "Description": "optional",
+        "Tags": "optional",
+    },
+    "actions": [
+        "CreateWorkflow", "UpdateWorkflow", "DeleteWorkflow", "GetWorkflow",
+        "ListWorkflows", "ListWorkflowVersions", "StartWorkflowRun",
+        "StopWorkflowRun", "GetWorkflowRun", "ListWorkflowRuns",
+        "ListTagsForResource", "TagResource", "UntagResource",
+    ],
+    "response_notes": [
+        "CreateWorkflow/UpdateWorkflow return a `Warnings` list — ALWAYS surface it. "
+        "It is how the service reports silently-dropped attributes.",
+        "GetWorkflow returns `WorkflowDefinition` with the YAML inline; there is no need to "
+        "read the S3 object, and it reflects the immutable snapshot rather than whatever "
+        "is in the bucket now.",
+        "The workflow name in the ARN has a random 10-character suffix appended "
+        "(my-wf -> my-wf-a1b2c3d4e5). ListWorkflows returns the BARE name. "
+        "CloudWatch log groups use the SUFFIXED name from the ARN.",
+    ],
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  OBSERVABILITY / DEBUGGING
+# ══════════════════════════════════════════════════════════════════════════
+OBSERVABILITY = {
+    "log_group": "/aws/mwaa-serverless/{workflow_name_with_arn_suffix}/",
+    "log_stream": "workflow_id={wf}/run_id={run_id}/task_id={task_id}/attempt={n}.log",
+    "log_format": "One JSON object per event: {timestamp, level, event, logger, ...}. "
+                  "Task exceptions carry error_detail[].exc_type / .exc_value / .frames.",
+    "task_outcome_marker": 'The final event of each task stream is {"event": "Task finished", '
+                           '"final_state": "success"|"failed", "exit_code": N}.',
+    "critical_caveat": (
+        "A workflow run can report RunState=SUCCESS while individual tasks FAILED. Verified: a "
+        "task that raised NoSuchBucket was followed by a trigger_rule: all_done task that "
+        "succeeded, and the run reported SUCCESS. NEVER treat RunState=SUCCESS as proof that "
+        "every task succeeded — read each task's final_state from its log stream."
+    ),
+    "task_instances_format": (
+        "GetWorkflowRun returns RunDetail.TaskInstances as a list of STRINGS shaped "
+        "'ex_<uuid>_<task_id>_<attempt>', not objects. Parse the task_id out of the middle."
+    ),
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SERVICE OVERVIEW
+# ══════════════════════════════════════════════════════════════════════════
 SERVICE_OVERVIEW = {
     "what_is_mwaa_serverless": (
-        "Amazon MWAA Serverless is a serverless deployment option for MWAA that "
-        "eliminates managing Apache Airflow environments. It uses YAML-based "
-        "workflow definitions (not Python DAGs), automatic scaling, pay-per-use "
-        "pricing, and per-workflow IAM execution role isolation. It uses Apache "
-        "Airflow v3 with Python 3.12."
+        "Amazon MWAA Serverless runs Apache Airflow workflows without an Airflow environment "
+        "to manage. Workflows are declared in YAML (dag-factory format), scale automatically, "
+        "bill per task-second, and each workflow gets its own IAM execution role. "
+        "Runtime: Apache Airflow 3.0.6 on Python 3.12."
     ),
     "how_it_differs_from_classic_mwaa": {
-        "service_name": "mwaa-serverless (NOT mwaa)",
-        "no_environments": "There are no 'environments' to create or manage. The unit of deployment is a 'workflow'.",
-        "no_airflow_ui": "No direct Airflow UI access. Monitoring is via CloudWatch logs and the console.",
-        "yaml_only": "Workflows are defined in YAML (DAG factory format), not Python.",
-        "per_workflow_isolation": "Each workflow has its own IAM execution role and isolated compute.",
-        "pay_per_use": "You only pay for actual workflow run time, no idle infrastructure costs.",
+        "service_name": "mwaa-serverless (classic MWAA is 'mwaa')",
+        "no_environments": "There is no environment to create. The unit of deployment is a workflow.",
+        "no_airflow_ui": "No Airflow UI. Observability is CloudWatch Logs plus the console.",
+        "yaml_only": "Workflows are YAML, not Python DAG files. Custom code is uploaded separately.",
+        "per_workflow_isolation": "One execution role and isolated compute per workflow; each task "
+                                  "provisions its own worker, so expect per-task startup latency.",
+        "pay_per_use": "You pay only for task run time.",
     },
-    "dag_authoring_guidelines": {
-        "provisioning_with_cloudformation": (
-            "When a DAG needs AWS resources for testing (e.g., SQS queues, SNS topics, "
-            "Lambda functions, Step Functions state machines, IAM roles for those services, "
-            "S3 buckets, Athena databases, Glue databases, VPCs, etc.), use "
-            "CloudFormationCreateStackOperator with an inline CloudFormation template in the "
-            "'TemplateBody' parameter (as a YAML text block). This makes DAGs FULLY SELF-CONTAINED "
-            "so they can run without any pre-existing infrastructure. Pair it with "
-            "CloudFormationDeleteStackOperator for cleanup. The generate_dag_yaml tool templates "
-            "follow this pattern: they provision all prerequisite resources via CloudFormation "
-            "at the start, run the actual service operations, then tear everything down."
-        ),
-        "always_clean_up": (
-            "DAGs should ALWAYS clean up any resources they create, unless the user explicitly "
-            "says otherwise. For CloudFormation-provisioned resources, add a "
-            "CloudFormationDeleteStackOperator at the end. For S3 objects, use "
-            "S3DeleteObjectsOperator then S3DeleteBucketOperator. CRITICAL: All cleanup tasks "
-            "MUST set 'trigger_rule: all_done' so they run regardless of whether upstream tasks "
-            "succeed or fail. This prevents resource leaks on DAG failure."
-        ),
-        "use_params_with_defaults": (
-            "Always use '{{ params.X }}' Jinja references for configurable values (bucket names, "
-            "role ARNs, database names, job names, etc.). Always provide working default values "
-            "in the DAG-level 'params' section. Use unique values where appropriate (e.g., include "
-            "a random suffix like '{{ macros.uuid.uuid4().hex[:8] }}' in resource names, or use "
-            "descriptive defaults like 'mwaa-demo-bucket-<unique>' that the user should replace)."
-        ),
-    },
-    "workflow_when_user_says_create_dag": {
-        "description": (
-            "When the user asks to CREATE a DAG, follow ALL of these steps in order:"
-        ),
-        "step_1": "Call generate_dag_yaml to produce the YAML.",
-        "step_2": "Call validate_dag_yaml on the generated YAML to check for errors.",
-        "step_3": (
-            "Call generate_execution_role with the YAML to produce a permissive IAM "
-            "execution role and policy scoped to the operators in the DAG. The role "
-            "trusts airflow-serverless.amazonaws.com and includes CloudWatch Logs, "
-            "IAM PassRole, and all service-specific permissions detected from the operators."
-        ),
-        "step_4": (
-            "Present the user with: (a) the YAML, (b) the IAM trust policy and permissions "
-            "policy, (c) ready-to-run AWS CLI commands to create the role, attach the policy, "
-            "upload the YAML to S3, create the workflow, and start a run."
-        ),
-    },
-    "workflow_when_user_says_test_dag": {
-        "description": (
-            "When the user asks to TEST a DAG, follow ALL of these steps in order. "
-            "The goal is end-to-end: generate, validate, deploy, execute, and surface any failures."
-        ),
-        "step_1": "Call generate_dag_yaml to produce the YAML.",
-        "step_2": (
-            "Call validate_dag_yaml on the generated YAML. If validation returns errors, "
-            "fix them and re-validate before proceeding. Show the user any warnings."
-        ),
-        "step_3": (
-            "Call generate_execution_role with the YAML to produce a permissive IAM "
-            "execution role and policy. Execute the AWS CLI commands to create the role "
-            "and attach the policy (or confirm the role already exists)."
-        ),
-        "step_4": (
-            "Upload the YAML to the S3 bucket using: "
-            "aws s3 cp <local-file> s3://<bucket>/<key>"
-        ),
-        "step_5": (
-            "Create or update the workflow using: "
-            "aws mwaa-serverless create-workflow --name <name> "
-            "--definition-s3-location '{\"Bucket\": \"<bucket>\", \"ObjectKey\": \"<key>\"}' "
-            "--execution-role-arn <role-arn>. "
-            "If the workflow already exists, use update-workflow instead."
-        ),
-        "step_6": (
-            "Start a workflow run using: "
-            "aws mwaa-serverless start-workflow-run --workflow-arn <arn>"
-        ),
-        "step_7": (
-            "Poll the workflow run status using: "
-            "aws mwaa-serverless get-workflow --workflow-arn <arn> "
-            "until the run reaches a terminal state (SUCCESS, FAILED, TIMEOUT). "
-            "If the run FAILS, surface the failure reason and any error details to the user. "
-            "Check CloudWatch Logs for task-level errors if available."
-        ),
-    },
+    "yaml_schema": YAML_SCHEMA,
+    "authoring_policy": AUTHORING_POLICY,
+    "parameter_passing": PARAMETER_PASSING,
+    "code_support": CODE_SUPPORT,
+    "quotas": QUOTAS,
+    "observability": OBSERVABILITY,
+    "recently_added": RECENTLY_ADDED_FEATURES,
     "deployment_workflow": {
-        "step_1_s3_bucket": (
-            "Create an S3 bucket (same region, block all public access, versioning enabled) "
-            "to store your YAML workflow definition files."
-        ),
+        "step_1_s3_bucket": "An S3 bucket in the same Region, public access blocked, versioning on.",
         "step_2_execution_role": (
-            "Create an IAM execution role with trust policy for "
-            "'airflow-serverless.amazonaws.com'. The role needs permissions for "
-            "CloudWatch Logs (logs:CreateLogStream, logs:PutLogEvents), and "
-            "whatever AWS services your workflow tasks use (S3, Glue, Athena, etc.). "
-            "Optional: KMS permissions if using a customer-managed key."
+            "An IAM role trusting airflow-serverless.amazonaws.com, with logs:CreateLogStream and "
+            "logs:PutLogEvents plus the permissions the tasks need. Add iam:PassRole only when a "
+            "task hands a role to another service (Glue, EMR, SageMaker)."
         ),
-        "step_3_upload_yaml": "Upload your YAML workflow definition file to the S3 bucket.",
-        "step_4_create_workflow": (
-            "aws mwaa-serverless create-workflow "
-            "--name <workflow-name> "
-            "--definition-s3-location '{\"Bucket\": \"<bucket>\", \"ObjectKey\": \"<key>\"}' "
-            "--execution-role-arn <role-arn>"
+        "step_3_upload": "Upload the YAML definition, and the code bundle if using Python/Bash tasks.",
+        "step_4_create": (
+            "aws mwaa-serverless create-workflow --name <name> "
+            "--definition-s3-location '{\"Bucket\":\"<b>\",\"ObjectKey\":\"<k>\"}' "
+            "[--code '{\"S3Location\":{\"Bucket\":\"<b>\",\"ObjectKey\":\"code.zip\"}}'] "
+            "--role-arn <role-arn>"
         ),
-        "step_5_run_workflow": (
-            "aws mwaa-serverless start-workflow-run "
-            "--workflow-arn <workflow-arn>"
-        ),
+        "step_5_run": "aws mwaa-serverless start-workflow-run --workflow-arn <arn>",
         "step_6_monitor": (
-            "aws mwaa-serverless get-workflow --workflow-arn <workflow-arn> "
-            "to check status. Workflow run states: STARTING, QUEUED, RUNNING, "
-            "SUCCESS, FAILED, TIMEOUT, STOPPING, STOPPED."
+            "aws mwaa-serverless get-workflow-run --workflow-arn <arn> --run-id <id>. "
+            "Run states: STARTING, QUEUED, RUNNING, SUCCESS, FAILED, TIMEOUT, STOPPING, STOPPED. "
+            "Then verify per-task final_state in CloudWatch — see OBSERVABILITY.critical_caveat."
         ),
     },
     "workflow_types": {
-        "scheduled": "Runs on the schedule defined in the YAML. Can also be run on-demand.",
-        "manual_only": "Ignores any schedule, can only be run on-demand via StartWorkflowRun.",
-        "disabled": "Cannot be run on schedule or on-demand.",
+        "SCHEDULED": "Runs on the YAML schedule; can also be started on demand.",
+        "MANUAL": "Ignores the schedule; on-demand only.",
+        "DISABLED": "Cannot run at all.",
     },
     "execution_role_trust_policy": {
         "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "airflow-serverless.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }
-        ],
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "airflow-serverless.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
     },
     "prerequisites": [
-        "AWS account with mwaa-serverless permissions (airflow-serverless:* actions)",
-        "S3 bucket (same region, block public access, versioning enabled)",
+        "AWS account with airflow-serverless:* permissions",
+        "S3 bucket in the same Region (versioning recommended)",
         "IAM execution role trusting airflow-serverless.amazonaws.com",
-        "AWS CLI configured (verify with: aws mwaa-serverless help)",
+        "AWS CLI v2 recent enough to expose --code (verify: aws mwaa-serverless create-workflow help)",
     ],
     "available_regions": [
         "us-east-1", "us-east-2", "us-west-1", "us-west-2",
-        "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
-        "eu-south-2", "eu-central-2",
+        "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
+        "eu-north-1", "eu-south-1", "eu-south-2",
         "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
-        "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-southeast-5", "ap-southeast-7",
-        "ap-east-1",
-        "ca-central-1", "sa-east-1", "af-south-1",
+        "ap-south-1", "ap-south-2",
+        "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
+        "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+        "ap-east-1", "ap-east-2",
+        "ca-central-1", "ca-west-1", "sa-east-1", "af-south-1",
+        "il-central-1", "mx-central-1", "us-gov-east-1", "us-gov-west-1",
     ],
 }
