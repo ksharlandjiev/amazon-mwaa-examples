@@ -1,10 +1,39 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: MCP Server for MWAA Serverless DAG Factory YAML generation
+Description: MCP Server for MWAA Serverless workflow authoring, validation and operations
+
+# TRANSPORT: a Lambda Function URL with IAM authentication. There is no API Gateway.
+#
+# Why: API Gateway added no value here. It fronted a single POST/GET/DELETE route with
+# no authorizer, which meant anyone who learned the URL could invoke every tool using
+# THIS FUNCTION'S permissions — CreateWorkflow, UpdateWorkflow, DeleteWorkflow,
+# iam:PassRole and S3 read/write. AWS::Serverless::HttpApi also cannot express IAM
+# authorization at all (Auth.DefaultAuthorizer: AWS_IAM is a REST API feature and SAM
+# rejects it on an HTTP API), so securing it meant changing transport regardless.
+#
+# AuthType: AWS_IAM means callers must SigV4-sign with credentials that hold
+# lambda:InvokeFunctionUrl on this function. Verified: unsigned requests get
+# 403 Forbidden, SigV4-signed requests (signing service "lambda") get 200.
+#
+# Clients cannot sign by themselves. Use the AWS-maintained signing proxy:
+#   uvx mcp-proxy-for-aws@latest <FunctionUrl>
+#
+# For individual use, prefer NOT deploying this at all: src/local_server.py runs the
+# same tools over stdio as a child process of your MCP client, with no endpoint to
+# expose and AWS calls made under your own credentials. See README.md.
+#
+# No CORS block: browsers cannot SigV4-sign, so a browser origin cannot reach an
+# IAM-authenticated Function URL. Adding CORS would only imply otherwise.
+#
+# Still worth tightening: the Policies below use Resource "*". Scope them to the
+# workflows and buckets you use, and drop DeleteWorkflow if the server never deletes.
 
 Globals:
   Function:
-    Timeout: 29
+    # Function URLs allow a much longer request than API Gateway's hard 29s cap, so
+    # mwaa_poll_run can wait out a whole task instead of forcing the client to
+    # re-poll every 25 seconds. Raise further if you want longer single-call polls.
+    Timeout: 120
     Runtime: python3.12
     MemorySize: 512
 
@@ -14,6 +43,9 @@ Resources:
     Properties:
       Handler: app.handler
       CodeUri: src/
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: BUFFERED
       Policies:
         - Statement:
             - Effect: Allow
@@ -33,6 +65,11 @@ Resources:
               Action:
                 - s3:GetObject
                 - s3:PutObject
+                # DeleteObject is used to clean up the throwaway definition that
+                # preflight_dag_yaml stages so the service can validate it.
+                - s3:DeleteObject
+                - s3:ListBucket
+                - s3:GetBucketLocation
               Resource: "*"
             - Effect: Allow
               Action:
@@ -51,48 +88,23 @@ Resources:
               Condition:
                 StringEquals:
                   iam:PassedToService: airflow-serverless.amazonaws.com
-      Events:
-        McpApi:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref McpHttpApi
-            Path: /mcp
-            Method: POST
-        McpApiGet:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref McpHttpApi
-            Path: /mcp
-            Method: GET
-        McpApiDelete:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref McpHttpApi
-            Path: /mcp
-            Method: DELETE
       Environment:
         Variables:
           LOG_LEVEL: INFO
-
-  McpHttpApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      StageName: $default
-      CorsConfiguration:
-        AllowOrigins:
-          - '*'
-        AllowMethods:
-          - GET
-          - POST
-          - DELETE
-          - OPTIONS
-        AllowHeaders:
-          - '*'
+          # Optional: pin the model used by mwaa_get_failed_runs for root-cause
+          # analysis. Leave unset to try a built-in candidate list (a Bedrock model
+          # reaching end of life previously disabled this feature silently).
+          # BEDROCK_MODEL_ID: us.anthropic.claude-haiku-4-5-20251001-v1:0
 
 Outputs:
-  McpApiUrl:
-    Description: MCP Server API Gateway URL
-    Value: !Sub "https://${McpHttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp"
+  McpFunctionUrl:
+    Description: >-
+      IAM-authenticated MCP endpoint. Callers must SigV4-sign (service "lambda") and
+      hold lambda:InvokeFunctionUrl on this function. Point mcp-proxy-for-aws at it.
+    Value: !GetAtt McpFunctionUrl.FunctionUrl
   McpFunctionArn:
     Description: MCP Server Function ARN
     Value: !GetAtt McpFunction.Arn
+  InvokePolicyHint:
+    Description: IAM permission a caller needs to reach this endpoint
+    Value: !Sub '{"Effect":"Allow","Action":"lambda:InvokeFunctionUrl","Resource":"${McpFunction.Arn}"}'
