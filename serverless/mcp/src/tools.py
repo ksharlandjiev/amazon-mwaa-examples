@@ -1,14 +1,25 @@
-"""YAML generation and validation for MWAA Serverless DAG factory definitions."""
+"""YAML generation for MWAA Serverless DAG factory definitions.
+
+Validation lives in validator.py; structured assembly lives in builder.py.
+Everything generated here is passed through validator.repair() before it is
+returned, so template output is guaranteed to match the schema the service
+actually accepts.
+"""
 
 import re
 import yaml
-from schema import SUPPORTED_OPERATORS, ALLOWED_OPERATOR_VALUES
+import validator
+from schema import (SUPPORTED_OPERATORS, ALLOWED_OPERATOR_VALUES, OPERATOR_REQUIRED_PARAMS,
+                    OPERATOR_XCOM_RETURNS, SENSOR_SAFETY_DEFAULTS, is_sensor)
 from constraints import (
     SUPPORTED_JINJA_VARIABLES, SUPPORTED_MACROS,
     VALIDATED_DAG_PARAMS, IGNORED_DAG_PARAMS,
     VALIDATED_TASK_PARAMS, IGNORED_TASK_PARAMS,
     AWS_BASE_OPERATOR_ATTRS, UNSUPPORTED_FEATURES,
     MWAA_API_ACTIONS, SERVICE_OVERVIEW,
+    YAML_SCHEMA, AUTHORING_POLICY, PARAMETER_PASSING,
+    CODE_SUPPORT, QUOTAS, OBSERVABILITY, DEFAULT_ARGS_ALLOWLIST,
+    UNSUPPORTED_JINJA_REPLACEMENTS, RECENTLY_ADDED_FEATURES,
 )
 
 _JINJA_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_.]*)")
@@ -19,234 +30,168 @@ _DAG_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _DURATION_MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
-def _parse_duration_seconds(val):
-    """Parse a duration value to seconds. Accepts int or string like '5m'."""
-    if isinstance(val, (int, float)):
-        return val
-    if isinstance(val, str):
-        m = _DURATION_RE.match(val)
-        if m:
-            return int(m.group(1)) * _DURATION_MULTIPLIERS[m.group(2)]
-    return None
-
-
 def validate_yaml(yaml_content: str) -> dict:
-    """Validate a DAG factory YAML against the MWAA Serverless YAML schema."""
-    errors = []
-    warnings = []
+    """Validate DAG YAML against the real MWAA Serverless schema.
 
-    try:
-        data = yaml.safe_load(yaml_content)
-    except yaml.YAMLError as e:
-        return {"valid": False, "errors": [f"YAML parse error: {e}"], "warnings": []}
-
-    if not isinstance(data, dict):
-        return {"valid": False, "errors": ["Root must be a YAML mapping"], "warnings": []}
-
-    if len(data) > 1:
-        warnings.append("Schema allows maxProperties: 1 at root (single DAG per file)")
-
-    for dag_key, dag_cfg in data.items():
-        if not _DAG_ID_RE.match(dag_key):
-            errors.append(f"DAG key '{dag_key}' must match ^[a-zA-Z0-9_-]+$")
-
-        if not isinstance(dag_cfg, dict):
-            errors.append(f"'{dag_key}' must be a mapping")
-            continue
-
-        if "tasks" not in dag_cfg:
-            errors.append(f"'{dag_key}' missing required field 'tasks'")
-            continue
-
-        # DAG-level param checks
-        for key in dag_cfg:
-            if key in ("tasks", "params", "default_args", "description", "schedule",
-                       "start_date", "end_date", "max_active_runs", "max_active_tasks", "dag_id"):
-                continue
-            if key in IGNORED_DAG_PARAMS:
-                warnings.append(f"DAG '{dag_key}': '{key}' is ignored by MWAA Serverless")
-            else:
-                warnings.append(f"DAG '{dag_key}': unknown DAG-level param '{key}'")
-
-        mar = dag_cfg.get("max_active_runs")
-        if mar is not None and (not isinstance(mar, int) or mar < 1):
-            errors.append(f"DAG '{dag_key}': max_active_runs must be integer >= 1")
-
-        mat = dag_cfg.get("max_active_tasks")
-        if mat is not None and (not isinstance(mat, int) or mat < 1):
-            errors.append(f"DAG '{dag_key}': max_active_tasks must be integer >= 1")
-
-        # default_args validation
-        da = dag_cfg.get("default_args", {})
-        if isinstance(da, dict):
-            da_retries = da.get("retries")
-            if da_retries is not None and (not isinstance(da_retries, int) or da_retries < 0):
-                errors.append(f"DAG '{dag_key}': default_args.retries must be integer >= 0")
-            da_rd = da.get("retry_delay")
-            if da_rd is not None and _parse_duration_seconds(da_rd) is None:
-                errors.append(f"DAG '{dag_key}': default_args.retry_delay must match pattern ^\\d+[smhd]$")
-            da_et = da.get("execution_timeout")
-            if da_et is not None and _parse_duration_seconds(da_et) is None:
-                errors.append(f"DAG '{dag_key}': default_args.execution_timeout must match pattern ^\\d+[smhd]$")
-
-        # Tasks validation — schema says tasks is an array
-        tasks = dag_cfg["tasks"]
-        if isinstance(tasks, list):
-            _validate_task_list(tasks, dag_key, errors, warnings)
-        elif isinstance(tasks, dict):
-            # Also accept dict format for backward compat with earlier examples
-            _validate_task_dict(tasks, dag_key, errors, warnings)
-        else:
-            errors.append(f"'{dag_key}' tasks must be an array or mapping")
-
-    _check_jinja_refs(data, warnings)
-    return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+    Thin delegation to validator.validate() so there is exactly one source of
+    truth for what the service accepts.
+    """
+    return validator.validate(yaml_content)
 
 
-def _validate_task_list(tasks, dag_key, errors, warnings):
-    """Validate tasks as array (per the YAML schema)."""
-    task_ids = set()
-    for i, task_cfg in enumerate(tasks):
-        if not isinstance(task_cfg, dict):
-            errors.append(f"DAG '{dag_key}' task[{i}] must be a mapping")
-            continue
-        tid = task_cfg.get("task_id")
-        if not tid:
-            errors.append(f"DAG '{dag_key}' task[{i}] missing 'task_id'")
-        elif not _TASK_ID_RE.match(tid):
-            errors.append(f"Task '{tid}': task_id must match ^[a-zA-Z0-9_-]+$")
-        else:
-            task_ids.add(tid)
-
-    for task_cfg in tasks:
-        if not isinstance(task_cfg, dict):
-            continue
-        tid = task_cfg.get("task_id", f"task[?]")
-        _validate_task_common(task_cfg, tid, dag_key, task_ids, errors, warnings)
+def repair_yaml(yaml_content: str) -> dict:
+    """Rewrite common schema mistakes into the form the service accepts."""
+    return validator.repair(yaml_content)
 
 
-def _validate_task_dict(tasks, dag_key, errors, warnings):
-    """Validate tasks as dict (backward compat)."""
-    task_ids = set(tasks.keys())
-    for task_name, task_cfg in tasks.items():
-        if not isinstance(task_cfg, dict):
-            errors.append(f"Task '{task_name}' in '{dag_key}' must be a mapping")
-            continue
-        tid = task_cfg.get("task_id", task_name)
-        _validate_task_common(task_cfg, tid, dag_key, task_ids, errors, warnings)
+def _finalise(dag_dict, note=""):
+    """Dump, repair and validate a generated DAG. Returns a structured result."""
+    raw = yaml.dump(dag_dict, default_flow_style=False, sort_keys=False, width=4096, allow_unicode=True)
+    fixed = validator.repair(raw)
+    result = fixed["validation"] or validator.validate(fixed["repaired_yaml"])
+    out = {
+        "dag_yaml": fixed["repaired_yaml"],
+        "valid": result["valid"],
+        "errors": result["errors"],
+        "warnings": result["warnings"],
+        "hints": result["hints"],
+        "summary": result["summary"],
+        "normalisations_applied": fixed["changes"],
+    }
+    if note:
+        out["note"] = note
+    return out
 
 
-def _validate_task_common(task_cfg, tid, dag_key, task_ids, errors, warnings):
-    """Validate a single task against all constraints."""
-    op = task_cfg.get("operator")
-    if not op:
-        errors.append(f"Task '{tid}' missing 'operator'")
-        return
-
-    if op not in ALLOWED_OPERATOR_VALUES:
-        errors.append(f"Task '{tid}': operator '{op}' not in supported operators list.")
-        return
-
-    # Deferrable
-    if task_cfg.get("deferrable"):
-        errors.append(f"Task '{tid}': deferrable=True not supported.")
-
-    # Dynamic mapping
-    if "expand" in task_cfg or "map" in task_cfg:
-        errors.append(f"Task '{tid}': dynamic task mapping not supported.")
-
-    # AWS base attrs (check both top-level and inside parameters)
-    for scope in (task_cfg, task_cfg.get("parameters", {})):
-        if not isinstance(scope, dict):
-            continue
-        for attr, msg in AWS_BASE_OPERATOR_ATTRS.items():
-            if attr in scope:
-                if "Not supported" in msg:
-                    errors.append(f"Task '{tid}': '{attr}' is {msg} in MWAA Serverless.")
-                elif attr == "aws_conn_id":
-                    warnings.append(f"Task '{tid}': aws_conn_id is controlled by service.")
-                elif attr == "region_name":
-                    warnings.append(f"Task '{tid}': region_name is set from environment.")
-
-    # Task-level validated params
-    retries = task_cfg.get("retries")
-    if retries is not None and (not isinstance(retries, int) or retries < 0 or retries > 3):
-        errors.append(f"Task '{tid}': retries must be 0-3 (got {retries})")
-
-    rd = task_cfg.get("retry_delay")
-    if rd is not None:
-        rd_s = _parse_duration_seconds(rd)
-        if rd_s is None:
-            errors.append(f"Task '{tid}': retry_delay must be int or match ^\\d+[smhd]$")
-        elif rd_s < 0 or rd_s > 300:
-            errors.append(f"Task '{tid}': retry_delay must be 0-300 seconds (got {rd_s}s)")
-
-    et = task_cfg.get("execution_timeout")
-    if et is not None:
-        et_s = _parse_duration_seconds(et)
-        if et_s is None:
-            errors.append(f"Task '{tid}': execution_timeout must be int or match ^\\d+[smhd]$")
-        elif et_s > 3600:
-            errors.append(f"Task '{tid}': execution_timeout max 3600 seconds (got {et_s}s)")
-
-    # Ignored task params
-    for key in task_cfg:
-        if key in IGNORED_TASK_PARAMS:
-            warnings.append(f"Task '{tid}': '{key}' is ignored by MWAA Serverless")
-
-    # Dependency refs (upstream_tasks / downstream_tasks / dependencies)
-    for dep_key in ("upstream_tasks", "downstream_tasks", "dependencies"):
-        for dep in task_cfg.get(dep_key, []):
-            if dep not in task_ids:
-                errors.append(f"Task '{tid}': {dep_key} references '{dep}' which doesn't exist in '{dag_key}'")
+# Matches the CloudFormation-outputs-via-XCom pattern, e.g.
+#   {{ ti.xcom_pull(task_ids='create_glue_stack')['CreateStackResponse']['Outputs'][0]['OutputValue'] }}
+_CFN_OUTPUT_XCOM_RE = re.compile(
+    r"\{\{\s*ti\.xcom_pull\(\s*task_ids\s*=\s*['\"](?P<task>[^'\"]+)['\"]\s*\)"
+    r"\s*\[\s*['\"]CreateStackResponse['\"]\s*\]"
+    r"\s*\[\s*['\"]Outputs['\"]\s*\]"
+    r"\s*\[\s*(?P<idx>\d+)\s*\]"
+    r"\s*\[\s*['\"]OutputValue['\"]\s*\]\s*\}\}"
+)
 
 
-def _check_jinja_refs(data, warnings):
-    strings = []
-    _collect_strings(data, strings)
-    for s in strings:
-        for match in _JINJA_VAR_RE.finditer(s):
-            var = match.group(1)
-            root = var.split(".")[0]
-            if root in SUPPORTED_JINJA_VARIABLES or root in ("ti", "task_instance", "macros"):
-                continue
-            if var in SUPPORTED_MACROS:
-                continue
-            warnings.append(f"Jinja '{{{{ {var} }}}}' may not be supported. Supported vars: {', '.join(sorted(SUPPORTED_JINJA_VARIABLES))}")
+def _replace_cfn_output_xcoms(tasks, params):
+    """Rewrite unresolvable CloudFormation-output XCom references into params.
+
+    CloudFormationCreateStackOperator returns None, so reading
+    ['CreateStackResponse']['Outputs'][n]['OutputValue'] from its XCom raises
+    TypeError at run time (verified against the live service). These templates
+    predate that finding. Each such reference is replaced with a DAG param whose
+    default is an obvious placeholder, so the demo is honest about needing a real
+    value instead of failing with a confusing NoneType error.
+
+    Returns the list of param names introduced.
+    """
+    introduced = []
+
+    def _fix(value, owner_task, field):
+        if not isinstance(value, str):
+            return value
+
+        def _sub(m):
+            base = f"{m.group('task')}_output_{m.group('idx')}"
+            base = base.replace("create_", "").replace("_stack", "")
+            key = re.sub(r"[^a-zA-Z0-9_]", "_", base)
+            if key not in params:
+                params[key] = f"REPLACE_ME__{field}_from_stack_output_{m.group('idx')}"
+                introduced.append(key)
+            return "{{ params.%s }}" % key
+
+        return _CFN_OUTPUT_XCOM_RE.sub(_sub, value)
+
+    def _walk(node, owner_task, field):
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                if isinstance(v, str):
+                    node[k] = _fix(v, owner_task, k)
+                else:
+                    _walk(v, owner_task, k)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                if isinstance(v, str):
+                    node[i] = _fix(v, owner_task, field)
+                else:
+                    _walk(v, owner_task, field)
+
+    entries = tasks.items() if isinstance(tasks, dict) else enumerate(tasks)
+    for tid, tcfg in entries:
+        if isinstance(tcfg, dict):
+            _walk(tcfg, tid, "value")
+    return introduced
 
 
-def _collect_strings(obj, result):
-    if isinstance(obj, str):
-        result.append(obj)
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            _collect_strings(v, result)
-    elif isinstance(obj, list):
-        for v in obj:
-            _collect_strings(v, result)
 
 
 def generate_yaml(dag_id, service, description="", schedule="None", params=None):
-    """Generate a DAG factory YAML using the dict-based task schema matching official examples."""
+    """Produce a runnable, self-contained demo DAG for one AWS service.
+
+    These templates provision their own prerequisites and tear them down, so they
+    run in an empty account. That makes them useful for trying a service out and a
+    poor starting point for a real pipeline — a real pipeline should reference
+    resources that already exist. Use plan_pipeline + build_dag_yaml for that.
+    """
     templates = _get_service_templates()
     svc = service.lower().replace(" ", "_")
     if svc not in templates:
-        return f"Unknown service '{service}'. Available: {', '.join(sorted(templates.keys()))}"
+        return {"error": f"Unknown service '{service}'. Available: {', '.join(sorted(templates.keys()))}"}
 
     t = templates[svc]
     tasks = _resolve_operator_fqns(t["tasks"])
     tasks = _normalize_tasks_to_dict(tasks)
-    dag = {dag_id: {"schedule": schedule, "tasks": tasks}}
-    # Apply extra fields (dag_id, default_args, etc.)
+    _apply_sensor_safety_defaults(tasks)
+    resolved_params = dict(params or t.get("default_params") or {})
+    introduced = _replace_cfn_output_xcoms(tasks, resolved_params)
+    dag = {dag_id: {"schedule": schedule if schedule not in ("None", "none", "") else None,
+                    "tasks": tasks}}
     for k, v in t.get("extra_fields", {}).items():
+        if k == "dag_id":
+            continue  # ignored by the service; the root key is the dag_id
         dag[dag_id][k] = v
     if description:
         dag[dag_id]["description"] = description
-    if params:
-        dag[dag_id]["params"] = params
-    elif t.get("default_params"):
-        dag[dag_id]["params"] = t["default_params"]
-    return yaml.dump(dag, default_flow_style=False, sort_keys=False)
+    if resolved_params:
+        dag[dag_id]["params"] = resolved_params
+
+    note = (
+        "This is a self-contained DEMO for the '%s' service: it provisions its own "
+        "prerequisites and cleans them up. For a production pipeline that uses existing "
+        "resources, call plan_pipeline then build_dag_yaml instead." % svc
+    )
+    out = _finalise(dag, note=note)
+    if introduced:
+        out["params_you_must_set"] = introduced
+        out["params_note"] = (
+            "These params replaced references to CloudFormation stack outputs. "
+            "CloudFormationCreateStackOperator returns None via XCom, so reading stack Outputs "
+            "from it fails at run time. Set each param to the real resource identifier the stack "
+            "creates (or to an existing resource) before deploying."
+        )
+    return out
+
+
+def _apply_sensor_safety_defaults(tasks):
+    """Bound every sensor's wait unless the template already does.
+
+    These demo templates wait on CloudFormation stacks and Glue jobs, and a sensor
+    holds a worker slot for its entire wait, which MWAA Serverless bills for. Airflow's
+    default timeout is 7 days. `mode` is deliberately untouched: reschedule mode would
+    release the worker but is not currently supported end to end on this service.
+    """
+    applied = []
+    if not isinstance(tasks, dict):
+        return applied
+    for tid, tcfg in tasks.items():
+        if not isinstance(tcfg, dict) or not is_sensor(tcfg.get("operator")):
+            continue
+        for key, value in SENSOR_SAFETY_DEFAULTS.items():
+            if key not in tcfg:
+                tcfg[key] = value
+                applied.append(f"{tid}.{key}={value}")
+    return applied
 
 
 def _normalize_tasks_to_dict(tasks):
@@ -311,6 +256,7 @@ def get_service_tasks(service):
     t = templates[svc]
     tasks = _resolve_operator_fqns(t["tasks"])
     tasks = _normalize_tasks_to_dict(tasks)
+    _apply_sensor_safety_defaults(tasks)
     return {
         "service": svc,
         "tasks": tasks,
@@ -319,17 +265,18 @@ def get_service_tasks(service):
 
 
 def compose_dag_yaml(dag_id, services_config, description="", schedule="None", params=None):
-    """Compose a multi-service DAG from service task blocks with custom dependencies.
+    """Chain several self-contained service DEMO blocks into one DAG.
+
+    Each block still provisions and tears down its own prerequisites, so the
+    result is large. This is for demonstrating several services together, not for
+    building a production pipeline — for that use plan_pipeline + build_dag_yaml,
+    which produces one task per operation you actually asked for.
 
     services_config is a list of dicts:
       [
         {"service": "s3", "task_prefix": "s3", "depends_on": []},
         {"service": "glue", "task_prefix": "glue", "depends_on": ["s3"]},
       ]
-
-    Each service's tasks are prefixed to avoid ID collisions. Dependencies between
-    services are wired by connecting the last non-cleanup task of the upstream service
-    to the first task of the downstream service.
     """
     import copy
     templates = _get_service_templates()
@@ -345,11 +292,12 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
         depends_on = cfg.get("depends_on", [])
 
         if svc not in templates:
-            return f"Unknown service '{svc}'. Available: {', '.join(sorted(templates.keys()))}"
+            return {"error": f"Unknown service '{svc}'. Available: {', '.join(sorted(templates.keys()))}"}
 
         t = templates[svc]
         tasks = _resolve_operator_fqns(t["tasks"])
         tasks = _normalize_tasks_to_dict(tasks)
+        _apply_sensor_safety_defaults(tasks)
 
         # Prefix all task IDs and rewrite dependency references
         old_to_new = {}
@@ -402,7 +350,8 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
             _rewrite_param_refs(tcfg, prefix)
 
     # Build DAG
-    dag = {dag_id: {"schedule": schedule, "tasks": all_tasks}}
+    dag = {dag_id: {"schedule": schedule if schedule not in ("None", "none", "") else None,
+                    "tasks": all_tasks}}
     if description:
         dag[dag_id]["description"] = description
     merged_params = {**(params or {})}
@@ -412,7 +361,10 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
     if merged_params:
         dag[dag_id]["params"] = merged_params
 
-    return yaml.dump(dag, default_flow_style=False, sort_keys=False)
+    return _finalise(dag, note=(
+        "Composed from self-contained demo blocks, so it includes provisioning and cleanup "
+        "tasks for every service. For a production pipeline use plan_pipeline + build_dag_yaml."
+    ))
 
 
 def _rewrite_param_refs(obj, prefix):
@@ -438,15 +390,61 @@ def list_unsupported():
 
 def get_constraints():
     return {
+        "yaml_schema": YAML_SCHEMA,
+        "authoring_policy": AUTHORING_POLICY,
+        "parameter_passing": PARAMETER_PASSING,
         "supported_jinja_variables": sorted(SUPPORTED_JINJA_VARIABLES),
         "supported_macros": sorted(SUPPORTED_MACROS),
+        "unsupported_jinja_variables": UNSUPPORTED_JINJA_REPLACEMENTS,
         "validated_dag_params": VALIDATED_DAG_PARAMS,
         "ignored_dag_params": sorted(IGNORED_DAG_PARAMS),
         "validated_task_params": VALIDATED_TASK_PARAMS,
         "ignored_task_params": sorted(IGNORED_TASK_PARAMS),
+        "default_args_allowlist": sorted(DEFAULT_ARGS_ALLOWLIST),
         "aws_base_operator_attrs": AWS_BASE_OPERATOR_ATTRS,
         "unsupported_features": UNSUPPORTED_FEATURES,
+        "recently_added_features": RECENTLY_ADDED_FEATURES,
+        "python_bash_code_support": CODE_SUPPORT,
+        "quotas": QUOTAS,
+        "observability": OBSERVABILITY,
         "mwaa_api_actions": MWAA_API_ACTIONS,
+    }
+
+
+def get_dag_yaml_spec():
+    """The authoritative YAML schema, with a worked example and the exact
+    service error each mistake produces."""
+    return {
+        "schema": YAML_SCHEMA,
+        "parameter_passing": PARAMETER_PASSING,
+        "authoring_policy": AUTHORING_POLICY,
+        "default_args_allowlist": sorted(DEFAULT_ARGS_ALLOWLIST),
+        "quotas": QUOTAS,
+        "python_bash": {
+            "operators": CODE_SUPPORT["operators"],
+            "how_code_is_delivered": CODE_SUPPORT["how_code_is_delivered"],
+            "when_to_use": CODE_SUPPORT["when_to_use"],
+        },
+    }
+
+
+def describe_operator(operator: str):
+    """Required arguments and XCom behaviour for one operator."""
+    from schema import resolve_operator_fqn
+    fqn, short, was_short = resolve_operator_fqn(operator)
+    if not fqn:
+        bare = operator.rsplit(".", 1)[-1] if operator else ""
+        close = [k for k in SUPPORTED_OPERATORS if bare and bare.lower()[:6] in k.lower()][:8]
+        return {"error": f"'{operator}' is not in the MWAA Serverless allowlist.",
+                "did_you_mean": close}
+    return {
+        "operator": short,
+        "operator_fqn": fqn,
+        "use_this_value_in_yaml": fqn,
+        "short_name_is_invalid": "MWAA Serverless rejects short operator names; always emit the FQN.",
+        "required_arguments": OPERATOR_REQUIRED_PARAMS.get(short, []),
+        "xcom_output": OPERATOR_XCOM_RETURNS.get(short, "Not documented — assume no useful XCom value."),
+        "reminder": "Do not set aws_conn_id, region_name, verify or botocore_config.",
     }
 
 
@@ -454,41 +452,185 @@ def get_overview():
     return SERVICE_OVERVIEW
 
 
-# ── Operator FQN to IAM service/action mapping ──
+# ── Operator module -> least-privilege IAM actions ──
+# Scoped to the calls the operators actually make. Previously every entry was a
+# service-wide wildcard, which produced roles far broader than the DAG needed.
 _OPERATOR_IAM_MAP = {
-    "s3": {"actions": ["s3:*"], "resource": "*"},
-    "glue": {"actions": ["glue:*"], "resource": "*"},
-    "glue_databrew": {"actions": ["databrew:*"], "resource": "*"},
-    "glue_crawler": {"actions": ["glue:*"], "resource": "*"},
-    "athena": {"actions": ["athena:*", "s3:*", "glue:*"], "resource": "*"},
-    "bedrock": {"actions": ["bedrock:*"], "resource": "*"},
-    "lambda_function": {"actions": ["lambda:*"], "resource": "*"},
-    "step_function": {"actions": ["states:*"], "resource": "*"},
-    "emr": {"actions": ["elasticmapreduce:*", "ec2:*"], "resource": "*"},
-    "batch": {"actions": ["batch:*"], "resource": "*"},
-    "ecs": {"actions": ["ecs:*", "ec2:*"], "resource": "*"},
-    "eks": {"actions": ["eks:*", "ec2:*"], "resource": "*"},
-    "cloud_formation": {"actions": ["cloudformation:*", "iam:*"], "resource": "*"},
-    "sagemaker": {"actions": ["sagemaker:*"], "resource": "*"},
-    "sagemaker_unified_studio": {"actions": ["sagemaker:*"], "resource": "*"},
-    "rds": {"actions": ["rds:*"], "resource": "*"},
-    "redshift_cluster": {"actions": ["redshift:*"], "resource": "*"},
-    "redshift_data": {"actions": ["redshift-data:*", "redshift-serverless:*"], "resource": "*"},
-    "dms": {"actions": ["dms:*"], "resource": "*"},
-    "ec2": {"actions": ["ec2:*"], "resource": "*"},
-    "sns": {"actions": ["sns:*"], "resource": "*"},
-    "sqs": {"actions": ["sqs:*"], "resource": "*"},
-    "eventbridge": {"actions": ["events:*"], "resource": "*"},
-    "comprehend": {"actions": ["comprehend:*"], "resource": "*"},
-    "kinesis_analytics": {"actions": ["kinesisanalytics:*"], "resource": "*"},
-    "neptune": {"actions": ["neptune-db:*", "rds:*"], "resource": "*"},
-    "glacier": {"actions": ["glacier:*"], "resource": "*"},
-    "datasync": {"actions": ["datasync:*"], "resource": "*"},
-    "appflow": {"actions": ["appflow:*"], "resource": "*"},
-    "quicksight": {"actions": ["quicksight:*"], "resource": "*"},
-    "dynamodb": {"actions": ["dynamodb:*"], "resource": "*"},
-    "opensearch_serverless": {"actions": ["aoss:*"], "resource": "*"},
+    "s3": {"actions": [
+        "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+        "s3:GetBucketLocation", "s3:CreateBucket", "s3:DeleteBucket",
+        "s3:GetBucketTagging", "s3:PutBucketTagging", "s3:AbortMultipartUpload",
+    ]},
+    "s3_tables": {"actions": [
+        "s3tables:CreateTableBucket", "s3tables:DeleteTableBucket", "s3tables:CreateNamespace",
+        "s3tables:DeleteNamespace", "s3tables:CreateTable", "s3tables:DeleteTable",
+        "s3tables:GetTableBucket", "s3tables:GetNamespace", "s3tables:GetTable",
+    ]},
+    "s3_vectors": {"actions": [
+        "s3vectors:CreateVectorBucket", "s3vectors:DeleteVectorBucket",
+        "s3vectors:CreateIndex", "s3vectors:DeleteIndex", "s3vectors:GetIndex",
+    ]},
+    "glue": {"actions": [
+        "glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:GetJob",
+        "glue:BatchStopJobRun", "glue:CreateJob", "glue:UpdateJob",
+        "glue:StartDataQualityRulesetEvaluationRun", "glue:GetDataQualityRulesetEvaluationRun",
+        "glue:CreateDataQualityRuleset", "glue:GetDataQualityRuleset",
+        "glue:StartDataQualityRuleRecommendationRun", "glue:GetDataQualityRuleRecommendationRun",
+    ]},
+    "glue_databrew": {"actions": ["databrew:StartJobRun", "databrew:DescribeJobRun", "databrew:DescribeJob"]},
+    "glue_crawler": {"actions": ["glue:StartCrawler", "glue:GetCrawler", "glue:GetCrawlerMetrics",
+                                 "glue:CreateCrawler", "glue:UpdateCrawler"]},
+    "glue_catalog": {"actions": [
+        "glue:GetDatabase", "glue:GetDatabases", "glue:CreateDatabase", "glue:DeleteDatabase",
+        "glue:GetTable", "glue:GetTables", "glue:CreateTable", "glue:DeleteTable",
+        "glue:GetPartition", "glue:GetPartitions", "glue:BatchCreatePartition",
+    ]},
+    "glue_catalog_partition": {"actions": ["glue:GetPartition", "glue:GetPartitions", "glue:GetTable"]},
+    "athena": {"actions": [
+        "athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults",
+        "athena:StopQueryExecution", "athena:GetWorkGroup", "athena:GetDataCatalog",
+        "glue:GetDatabase", "glue:GetTable", "glue:GetPartitions",
+        "s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation",
+        "s3:AbortMultipartUpload",
+    ]},
+    "bedrock": {"actions": [
+        "bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream",
+        "bedrock:CreateModelCustomizationJob", "bedrock:GetModelCustomizationJob",
+        "bedrock:Retrieve", "bedrock:RetrieveAndGenerate",
+        "bedrock:CreateGuardrail", "bedrock:DeleteGuardrail", "bedrock:GetGuardrail",
+    ]},
+    "lambda_function": {"actions": [
+        "lambda:InvokeFunction", "lambda:GetFunction", "lambda:GetFunctionConfiguration",
+        "lambda:CreateFunction",
+    ]},
+    "step_function": {"actions": [
+        "states:StartExecution", "states:DescribeExecution", "states:StopExecution",
+        "states:DescribeStateMachine", "states:GetExecutionHistory",
+    ]},
+    "emr": {"actions": [
+        "elasticmapreduce:RunJobFlow", "elasticmapreduce:AddJobFlowSteps",
+        "elasticmapreduce:DescribeStep", "elasticmapreduce:DescribeCluster",
+        "elasticmapreduce:TerminateJobFlows", "elasticmapreduce:ListSteps",
+        "elasticmapreduce:ModifyCluster",
+        "emr-serverless:StartJobRun", "emr-serverless:GetJobRun", "emr-serverless:CancelJobRun",
+        "emr-serverless:CreateApplication", "emr-serverless:GetApplication",
+        "emr-serverless:StartApplication", "emr-serverless:StopApplication",
+        "emr-serverless:DeleteApplication",
+        "emr-containers:StartJobRun", "emr-containers:DescribeJobRun",
+        "emr-containers:CreateVirtualCluster",
+    ]},
+    "batch": {"actions": [
+        "batch:SubmitJob", "batch:DescribeJobs", "batch:TerminateJob",
+        "batch:DescribeJobQueues", "batch:DescribeComputeEnvironments",
+        "batch:CreateComputeEnvironment",
+    ]},
+    "ecs": {"actions": [
+        "ecs:RunTask", "ecs:DescribeTasks", "ecs:StopTask", "ecs:CreateCluster",
+        "ecs:DeleteCluster", "ecs:DescribeClusters", "ecs:RegisterTaskDefinition",
+        "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition",
+    ]},
+    "eks": {"actions": [
+        "eks:CreateCluster", "eks:DeleteCluster", "eks:DescribeCluster",
+        "eks:CreateNodegroup", "eks:DeleteNodegroup", "eks:DescribeNodegroup",
+        "eks:CreateFargateProfile", "eks:DeleteFargateProfile", "eks:DescribeFargateProfile",
+    ]},
+    "cloud_formation": {"actions": [
+        "cloudformation:CreateStack", "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources", "cloudformation:GetTemplate",
+    ]},
+    "sagemaker": {"actions": [
+        "sagemaker:CreateTrainingJob", "sagemaker:DescribeTrainingJob",
+        "sagemaker:CreateProcessingJob", "sagemaker:DescribeProcessingJob",
+        "sagemaker:CreateTransformJob", "sagemaker:DescribeTransformJob",
+        "sagemaker:CreateModel", "sagemaker:DeleteModel",
+        "sagemaker:CreateEndpoint", "sagemaker:CreateEndpointConfig", "sagemaker:DescribeEndpoint",
+        "sagemaker:StartPipelineExecution", "sagemaker:DescribePipelineExecution",
+        "sagemaker:CreateHyperParameterTuningJob", "sagemaker:DescribeHyperParameterTuningJob",
+        "sagemaker:CreateAutoMLJob", "sagemaker:DescribeAutoMLJob",
+    ]},
+    "sagemaker_unified_studio": {"actions": [
+        "sagemaker:StartNotebookInstance", "sagemaker:StopNotebookInstance",
+        "sagemaker:DescribeNotebookInstance", "sagemaker:CreateNotebookInstance",
+    ]},
+    "rds": {"actions": [
+        "rds:CreateDBInstance", "rds:DeleteDBInstance", "rds:DescribeDBInstances",
+        "rds:StartDBInstance", "rds:StopDBInstance",
+        "rds:CreateDBSnapshot", "rds:CopyDBSnapshot", "rds:DeleteDBSnapshot",
+        "rds:DescribeDBSnapshots", "rds:StartExportTask", "rds:CancelExportTask",
+        "rds:DescribeExportTasks", "rds:CreateEventSubscription", "rds:DeleteEventSubscription",
+    ]},
+    "redshift_cluster": {"actions": [
+        "redshift:CreateCluster", "redshift:DeleteCluster", "redshift:DescribeClusters",
+        "redshift:PauseCluster", "redshift:ResumeCluster",
+        "redshift:CreateClusterSnapshot", "redshift:DeleteClusterSnapshot",
+        "redshift:DescribeClusterSnapshots",
+    ]},
+    "redshift_data": {"actions": [
+        "redshift-data:ExecuteStatement", "redshift-data:BatchExecuteStatement",
+        "redshift-data:DescribeStatement", "redshift-data:GetStatementResult",
+        "redshift-data:CancelStatement",
+        "redshift:GetClusterCredentials", "redshift-serverless:GetCredentials",
+    ]},
+    "dms": {"actions": [
+        "dms:CreateReplicationTask", "dms:DeleteReplicationTask",
+        "dms:DescribeReplicationTasks", "dms:StartReplicationTask", "dms:StopReplicationTask",
+    ]},
+    "ec2": {"actions": [
+        "ec2:RunInstances", "ec2:TerminateInstances", "ec2:StartInstances",
+        "ec2:StopInstances", "ec2:RebootInstances", "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
+    ]},
+    "sns": {"actions": ["sns:Publish", "sns:GetTopicAttributes"]},
+    "sqs": {"actions": [
+        "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes", "sqs:GetQueueUrl",
+    ]},
+    "eventbridge": {"actions": [
+        "events:PutEvents", "events:PutRule", "events:EnableRule",
+        "events:DisableRule", "events:DescribeRule",
+    ]},
+    "comprehend": {"actions": [
+        "comprehend:StartPiiEntitiesDetectionJob", "comprehend:DescribePiiEntitiesDetectionJob",
+        "comprehend:CreateDocumentClassifier", "comprehend:DescribeDocumentClassifier",
+    ]},
+    "kinesis_analytics": {"actions": [
+        "kinesisanalytics:CreateApplication", "kinesisanalytics:StartApplication",
+        "kinesisanalytics:StopApplication", "kinesisanalytics:DescribeApplication",
+    ]},
+    "neptune": {"actions": ["rds:StartDBCluster", "rds:StopDBCluster", "rds:DescribeDBClusters"]},
+    "glacier": {"actions": [
+        "glacier:InitiateJob", "glacier:DescribeJob", "glacier:GetJobOutput",
+        "glacier:UploadArchive",
+    ]},
+    "datasync": {"actions": [
+        "datasync:StartTaskExecution", "datasync:DescribeTaskExecution",
+        "datasync:CreateTask", "datasync:UpdateTask", "datasync:DeleteTask",
+        "datasync:ListTasks", "datasync:DescribeTask", "datasync:ListLocations",
+    ]},
+    "appflow": {"actions": ["appflow:StartFlow", "appflow:DescribeFlow",
+                            "appflow:DescribeFlowExecutionRecords", "appflow:UpdateFlow"]},
+    "quicksight": {"actions": ["quicksight:CreateIngestion", "quicksight:DescribeIngestion"]},
+    "dynamodb": {"actions": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:DescribeTable"]},
+    "opensearch_serverless": {"actions": ["aoss:BatchGetCollection", "aoss:APIAccessAll"]},
+    "mwaa_serverless": {"actions": [
+        "airflow-serverless:CreateWorkflow", "airflow-serverless:StartWorkflowRun",
+        "airflow-serverless:GetWorkflow", "airflow-serverless:GetWorkflowRun",
+    ]},
+    "python": {"actions": []},
+    "bash": {"actions": []},
+    "empty": {"actions": []},
 }
+
+# Operator modules whose tasks hand a role to another AWS service, so the
+# execution role needs iam:PassRole. Adding PassRole unconditionally is a
+# meaningful privilege escalation, so it is only included when needed.
+_PASSROLE_MODULES = {
+    "glue", "glue_crawler", "emr", "sagemaker", "sagemaker_unified_studio",
+    "ecs", "eks", "batch", "cloud_formation", "dms", "kinesis_analytics",
+    "datasync", "rds", "comprehend",
+}
+
 
 
 def generate_execution_role_policy(yaml_content):
@@ -499,33 +641,30 @@ def generate_execution_role_policy(yaml_content):
     except yaml.YAMLError as e:
         return {"error": f"YAML parse error: {e}"}
 
-    if not isinstance(data, dict):
-        return {"error": "Root must be a YAML mapping"}
+    if not isinstance(data, dict) or not data:
+        return {"error": "Root must be a non-empty YAML mapping keyed by dag_id."}
 
-    # Collect all operator FQNs from the DAG
     all_actions = set()
     operator_services = set()
+    unmapped = set()
     _extract_operators(data, operator_services)
 
     for svc in operator_services:
         if svc in _OPERATOR_IAM_MAP:
             all_actions.update(_OPERATOR_IAM_MAP[svc]["actions"])
+        else:
+            unmapped.add(svc)
 
-    # Always include CloudWatch Logs and IAM PassRole
-    statements = [
-        {
-            "Sid": "CloudWatchLogsAccess",
-            "Effect": "Allow",
-            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-            "Resource": "*",
-        },
-        {
-            "Sid": "IAMPassRoleAccess",
-            "Effect": "Allow",
-            "Action": ["iam:PassRole", "iam:GetRole"],
-            "Resource": "*",
-        },
-    ]
+    dag_id = list(data.keys())[0]
+    role_name = f"mwaa-serverless-{dag_id}-role"
+
+    # CloudWatch Logs is required for every workflow so task logs are captured.
+    statements = [{
+        "Sid": "WorkflowTaskLogging",
+        "Effect": "Allow",
+        "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"],
+        "Resource": "arn:aws:logs:*:*:log-group:/aws/mwaa-serverless/*",
+    }]
 
     if all_actions:
         statements.append({
@@ -533,6 +672,35 @@ def generate_execution_role_policy(yaml_content):
             "Effect": "Allow",
             "Action": sorted(all_actions),
             "Resource": "*",
+        })
+
+    # iam:PassRole only when a task actually hands a role to another service.
+    passrole_services = sorted(operator_services & _PASSROLE_MODULES)
+    if passrole_services:
+        statements.append({
+            "Sid": "PassRoleToAwsServices",
+            "Effect": "Allow",
+            "Action": ["iam:PassRole"],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": sorted({
+                        "glue.amazonaws.com" if s in ("glue", "glue_crawler") else
+                        "elasticmapreduce.amazonaws.com" if s == "emr" else
+                        "sagemaker.amazonaws.com" if s.startswith("sagemaker") else
+                        "ecs-tasks.amazonaws.com" if s == "ecs" else
+                        "eks.amazonaws.com" if s == "eks" else
+                        "batch.amazonaws.com" if s == "batch" else
+                        "cloudformation.amazonaws.com" if s == "cloud_formation" else
+                        "dms.amazonaws.com" if s == "dms" else
+                        "kinesisanalytics.amazonaws.com" if s == "kinesis_analytics" else
+                        "datasync.amazonaws.com" if s == "datasync" else
+                        "rds.amazonaws.com" if s == "rds" else
+                        "comprehend.amazonaws.com"
+                        for s in passrole_services
+                    })
+                }
+            },
         })
 
     policy = {"Version": "2012-10-17", "Statement": statements}
@@ -545,21 +713,62 @@ def generate_execution_role_policy(yaml_content):
         }],
     }
 
-    dag_id = list(data.keys())[0]
-    role_name = f"mwaa-serverless-{dag_id}-role"
+    needs_code = _dag_needs_code_bundle(data)
+    scope_down = [
+        "Replace Resource: \"*\" on OperatorPermissions with the specific bucket, job, table and "
+        "queue ARNs the DAG touches.",
+    ]
+    if "s3" in operator_services or "athena" in operator_services:
+        scope_down.append(
+            "S3 needs two entries per bucket: the bucket ARN for s3:ListBucket and "
+            "arn:aws:s3:::bucket/* for object actions."
+        )
+    if passrole_services:
+        scope_down.append(
+            "Narrow iam:PassRole to the exact service role ARNs the tasks pass, not \"*\"."
+        )
 
     return {
         "role_name": role_name,
         "trust_policy": trust_policy,
         "permissions_policy": policy,
         "detected_services": sorted(operator_services),
+        "unmapped_services": sorted(unmapped) or None,
+        "passrole_required_for": passrole_services or None,
+        "code_bundle_note": (
+            "This DAG has Python/Bash tasks. Their code runs under this same role, so it also "
+            "needs whatever AWS permissions the code itself calls."
+        ) if needs_code else None,
         "cli_commands": {
             "create_role": f"aws iam create-role --role-name {role_name} --assume-role-policy-document '{_json.dumps(trust_policy)}'",
             "put_policy": f"aws iam put-role-policy --role-name {role_name} --policy-name {dag_id}-policy --policy-document '{_json.dumps(policy)}'",
             "get_role_arn": f"aws iam get-role --role-name {role_name} --query 'Role.Arn' --output text",
         },
-        "note": "This is a permissive testing policy. For production, scope down to least-privilege.",
+        "note": (
+            "Actions are scoped to the API calls these operators make, but resources are still "
+            "\"*\". Tighten before production."
+        ),
+        "how_to_scope_down": scope_down,
     }
+
+
+def _dag_needs_code_bundle(data):
+    from schema import resolve_operator_fqn, CODE_OPERATORS
+    for dag_cfg in data.values():
+        tasks = (dag_cfg or {}).get("tasks")
+        if isinstance(tasks, dict):
+            entries = tasks.values()
+        elif isinstance(tasks, list):
+            entries = tasks
+        else:
+            continue
+        for tcfg in entries:
+            if not isinstance(tcfg, dict):
+                continue
+            _, short, _ = resolve_operator_fqn(tcfg.get("operator", "") or "")
+            if short in CODE_OPERATORS:
+                return True
+    return False
 
 
 def _extract_operators(obj, services):
@@ -2251,7 +2460,7 @@ def _get_service_templates():
             ],
         },
         "kinesis_analytics": {
-            "default_params": {"application_name": "mwaa-test-kinesis-app", "stack_name": "mwaa-test-kinesis-stack"},
+            "default_params": {"application_name": "mwaa-test-kinesis-app", "stack_name": "mwaa-test-kinesis-stack", "code_bucket": "REPLACE_ME_flink_code_bucket", "code_key": "flink-app.zip"},
             "tasks": [
                 {
                     "task_id": "create_kinesis_stack",
@@ -2294,6 +2503,27 @@ def _get_service_templates():
                         "application_name": "{{ params.application_name }}",
                         "runtime_environment": "FLINK-1_18",
                         "service_execution_role": "{{ ti.xcom_pull(task_ids='create_kinesis_stack')['CreateStackResponse']['Outputs'][0]['OutputValue'] }}",
+                        "create_application_kwargs": {
+                            "ApplicationConfiguration": {
+                                "FlinkApplicationConfiguration": {
+                                    "ParallelismConfiguration": {
+                                        "ConfigurationType": "CUSTOM",
+                                        "Parallelism": 1,
+                                        "ParallelismPerKPU": 1,
+                                        "AutoScalingEnabled": False,
+                                    }
+                                },
+                                "ApplicationCodeConfiguration": {
+                                    "CodeContent": {
+                                        "S3ContentLocation": {
+                                            "BucketARN": "arn:aws:s3:::{{ params.code_bucket }}",
+                                            "FileKey": "{{ params.code_key }}",
+                                        }
+                                    },
+                                    "CodeContentType": "ZIPFILE",
+                                },
+                            }
+                        },
                     },
                     "upstream_tasks": ["wait_for_kinesis_stack"],
                 },
