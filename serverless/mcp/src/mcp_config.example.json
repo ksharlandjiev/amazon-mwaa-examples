@@ -1,0 +1,29 @@
+{
+  "//": "Copy this file to mcp_config.json (same directory) and edit. Every key is optional; anything omitted keeps its built-in default. An environment variable of the same name always wins over this file — see config.py ENV_KEYS. Run the get_server_config tool to confirm what took effect.",
+
+  "//bedrock_model_id": "Pin ONE model for mwaa_get_failed_runs root-cause analysis. Setting this disables the fallback chain below, so an unreachable id fails loudly instead of quietly using a different model. Env: BEDROCK_MODEL_ID",
+  "bedrock_model_id": null,
+
+  "//bedrock_model_candidates": "Tried in order until one responds. Used only when bedrock_model_id is null. 'us.' ids are cross-Region inference profiles, needed because most current models are not available for direct on-demand invocation. Env: BEDROCK_MODEL_CANDIDATES (comma-separated)",
+  "bedrock_model_candidates": [
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "us.amazon.nova-lite-v1:0",
+    "amazon.nova-lite-v1:0",
+    "amazon.nova-micro-v1:0"
+  ],
+
+  "//bedrock_max_tokens": "Response budget for the analysis. Env: BEDROCK_MAX_TOKENS",
+  "bedrock_max_tokens": 2000,
+
+  "//bedrock_region": "Region for Bedrock only. null = the same Region as your workflows. Set this if the model you want is not offered where your workflows run. Env: BEDROCK_REGION",
+  "bedrock_region": null,
+
+  "//default_poll_seconds": "How long a single mwaa_poll_run call waits before returning. Env: MWAA_MCP_DEFAULT_POLL_SECONDS",
+  "default_poll_seconds": 90,
+
+  "//max_poll_seconds": "Hard cap for a single poll. Keep below the Lambda timeout in template.yaml (120s) so the function returns status instead of being killed. Env: MWAA_MCP_MAX_POLL_SECONDS",
+  "max_poll_seconds": 110,
+
+  "//log_level": "Env: LOG_LEVEL",
+  "log_level": "INFO"
+}
