@@ -7,10 +7,25 @@ from schema import SUPPORTED_OPERATORS, ALLOWED_OPERATOR_VALUES
 _SHORT_NAMES = set(SUPPORTED_OPERATORS.keys())
 _FQNS = set(SUPPORTED_OPERATORS.values())
 
-# Operators that are never compatible
-_BLOCKED_MODULES = {
-    "airflow.operators.python": "PythonOperator / @task not supported",
-    "airflow.operators.bash": "BashOperator not supported",
+# PythonOperator and BashOperator used to be blockers. They are now supported: the
+# YAML task references a callable or command, and the code itself is uploaded
+# separately as a code bundle via the CreateWorkflow `Code` parameter.
+_CODE_BUNDLE_MODULES = {
+    "airflow.operators.python": (
+        "PythonOperator is now SUPPORTED. Convert it to a YAML task with "
+        "python_callable: '<module>.<function>' and move the callable into a code "
+        "bundle module. Call get_code_bundle_guidance for the packaging rules."
+    ),
+    "airflow.providers.standard.operators.python": (
+        "PythonOperator is supported. Provide the callable in a code bundle."
+    ),
+    "airflow.operators.bash": (
+        "BashOperator is now SUPPORTED. Convert it to a YAML task with bash_command. "
+        "Scripts run with /usr/local/airflow/dags as the working directory."
+    ),
+    "airflow.providers.standard.operators.bash": (
+        "BashOperator is supported. Provide any script in a code bundle."
+    ),
 }
 
 # Imports that are only warnings (convertible)
@@ -38,7 +53,7 @@ def analyze_python_dag(source: str) -> dict:
     _check_dynamic_mapping(tree, errors)
     _check_deferrable(tree, errors)
     _check_callbacks(tree, warnings)
-    _check_python_callables(tree, errors)
+    _check_python_callables(tree, warnings)
     _check_python_logic(tree, errors)
     _check_dag_construction(tree, info, warnings)
 
@@ -72,15 +87,19 @@ def _collect_imports(tree):
 
 def _check_imports(imports, errors, warnings):
     for alias, full in imports.items():
-        for blocked_mod, reason in _BLOCKED_MODULES.items():
-            if full.startswith(blocked_mod):
-                errors.append(f"Import '{full}': {reason}")
+        for mod, note in _CODE_BUNDLE_MODULES.items():
+            if full.startswith(mod):
+                warnings.append(f"Import '{full}': {note}")
 
         # @task imports from airflow.decorators are errors
         if full.startswith("airflow.decorators"):
             class_name = full.rsplit(".", 1)[-1]
             if class_name == "task" or (class_name == "decorators" and alias == "task"):
-                errors.append(f"Import '{full}': @task decorator not supported")
+                errors.append(
+                    f"Import '{full}': the @task decorator (TaskFlow API) is not supported. "
+                    f"Rewrite the function as a plain callable and reference it from a "
+                    f"PythonOperator task with python_callable."
+                )
             elif full in _WARN_IMPORTS or class_name == "dag":
                 pass  # handled by _check_decorators as warning
 
@@ -176,10 +195,14 @@ def _check_callbacks(tree, warnings):
             warnings.append(f"'{node.arg}' is ignored by MWAA Serverless")
 
 
-def _check_python_callables(tree, errors):
+def _check_python_callables(tree, warnings):
     for node in ast.walk(tree):
         if isinstance(node, ast.keyword) and node.arg == "python_callable":
-            errors.append("python_callable parameter: PythonOperator not supported")
+            warnings.append(
+                "python_callable: PythonOperator is supported, but the callable must live in a "
+                "code bundle module and be referenced as 'module_name.function_name' in the YAML "
+                "(not as a Python reference). Extract the function into its own .py file."
+            )
 
 
 # Modules/functions that indicate Python logic not expressible in YAML

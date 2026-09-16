@@ -2,16 +2,21 @@
 
 import ast
 import yaml
+import validator
 from schema import SUPPORTED_OPERATORS
 
 _SHORT_NAMES = set(SUPPORTED_OPERATORS.keys())
 _FQN_TO_SHORT = {v: k for k, v in SUPPORTED_OPERATORS.items()}
 
-# Operators that can be replaced with EmptyOperator
+# Operators with no MWAA Serverless equivalent. PythonOperator and BashOperator are
+# NOT in this set any more — they are supported and convert to real tasks.
 _REPLACEABLE_WITH_EMPTY = {
-    "PythonOperator", "BashOperator", "DummyOperator",
-    "ShortCircuitOperator", "BranchPythonOperator",
+    "DummyOperator", "ShortCircuitOperator", "BranchPythonOperator",
+    "TriggerDagRunOperator", "ExternalTaskSensor", "LatestOnlyOperator",
 }
+
+# Operators whose code has to be supplied in a code bundle.
+_CODE_OPERATORS = {"PythonOperator", "BashOperator"}
 
 # Known FQN prefix -> short name class extraction
 _OPERATOR_MODULES = {
@@ -33,6 +38,8 @@ def convert_python_to_yaml(source: str) -> dict:
 
     errors = []
     replacements = []
+    code_actions = []
+    needs_code_bundle = False
     yaml_tasks = []
 
     for t in tasks:
@@ -54,6 +61,28 @@ def convert_python_to_yaml(source: str) -> dict:
         # Extract parameters
         params = {k: v for k, v in t.get("kwargs", {}).items()
                   if k not in ("task_id", "dag", "deferrable")}
+
+        # PythonOperator/BashOperator need their code supplied separately. A
+        # python_callable that was a Python reference cannot survive the conversion,
+        # so emit an explicit placeholder rather than dropping it silently.
+        if short in _CODE_OPERATORS:
+            needs_code_bundle = True
+            if short == "PythonOperator":
+                callable_name = t.get("kwargs", {}).get("python_callable")
+                if not isinstance(callable_name, str) or "." not in str(callable_name):
+                    guess = t.get("callable_name") or t["task_id"]
+                    params["python_callable"] = f"REPLACE_MODULE.{guess}"
+                    code_actions.append(
+                        f"'{t['task_id']}': set python_callable to '<module>.{guess}' and put "
+                        f"'{guess}' in a code-bundle module. It is currently the placeholder "
+                        f"'REPLACE_MODULE.{guess}'."
+                    )
+            elif short == "BashOperator" and "bash_command" not in params:
+                params["bash_command"] = "REPLACE_WITH_COMMAND"
+                code_actions.append(
+                    f"'{t['task_id']}': bash_command could not be extracted — set it explicitly."
+                )
+
         if params:
             yaml_task["parameters"] = params
 
@@ -89,7 +118,8 @@ def convert_python_to_yaml(source: str) -> dict:
     default_args = dag_kwargs.get("default_args", {})
     if default_args:
         clean_da = {k: v for k, v in default_args.items()
-                    if k in ("owner", "retries", "retry_delay", "execution_timeout")}
+                    if k in ("owner", "retries", "retry_delay", "execution_timeout")
+                    and v is not None}
         if clean_da:
             dag_def["default_args"] = clean_da
 
@@ -98,7 +128,7 @@ def convert_python_to_yaml(source: str) -> dict:
     # Normalize: convert list tasks to dict format, flatten parameters
     normalized_tasks = {}
     for t in yaml_tasks:
-        tid = t.get("task_id", "unknown")
+        tid = t.pop("task_id", "unknown")
         # Flatten parameters to top level
         params = t.pop("parameters", None)
         if isinstance(params, dict):
@@ -118,9 +148,37 @@ def convert_python_to_yaml(source: str) -> dict:
             tcfg["operator"] = SUPPORTED_OPERATORS[op]
 
     dag_id = dag_id or "converted_dag"
-    result_yaml = yaml.dump({dag_id: dag_def}, default_flow_style=False, sort_keys=False)
+    result_yaml = yaml.dump({dag_id: dag_def}, default_flow_style=False,
+                            sort_keys=False, width=4096, allow_unicode=True)
 
-    return {"yaml": result_yaml, "errors": errors, "replacements": replacements}
+    # Run the result through repair + validation so the caller gets a definition that
+    # is already in the shape the service accepts, and knows what still needs work.
+    fixed = validator.repair(result_yaml)
+    final_yaml = fixed["repaired_yaml"]
+    check = fixed["validation"] or validator.validate(final_yaml)
+
+    out = {
+        "yaml": final_yaml,
+        "valid": check["valid"],
+        "errors": errors + check["errors"],
+        "warnings": check["warnings"],
+        "hints": check["hints"],
+        "replacements": replacements,
+        "normalisations_applied": fixed["changes"],
+        "needs_code_bundle": needs_code_bundle,
+    }
+    if code_actions:
+        out["code_bundle_actions"] = code_actions
+        out["code_bundle_next_step"] = (
+            "Call get_code_bundle_guidance, put the callables in modules, then build_code_bundle "
+            "and pass the result to mwaa_deploy_and_run as code_zip_base64."
+        )
+    out["next_step"] = (
+        "Review replacements and errors, then preflight_dag_yaml before deploying."
+        if check["valid"] else
+        "Resolve the errors above; the definition is not deployable yet."
+    )
+    return out
 
 
 def _collect_imports(tree):
@@ -357,6 +415,32 @@ def _eval_const(node):
         val = _eval_const(node.operand)
         if isinstance(val, (int, float)):
             return -val
+    # timedelta(...) -> integer seconds, which is the form MWAA Serverless wants for
+    # retry_delay. The validator converts execution_timeout on to a timedelta mapping.
+    if isinstance(node, ast.Call):
+        fname = _get_call_name(node)
+        if fname == "timedelta":
+            mult = {"weeks": 604800, "days": 86400, "hours": 3600,
+                    "minutes": 60, "seconds": 1, "milliseconds": 0.001}
+            total = 0
+            matched = False
+            for kw in node.keywords:
+                if kw.arg in mult:
+                    v = _eval_const(kw.value)
+                    if isinstance(v, (int, float)):
+                        total += v * mult[kw.arg]
+                        matched = True
+            # timedelta(days, seconds, ...) positionally
+            order = ["days", "seconds", "microseconds", "milliseconds",
+                     "minutes", "hours", "weeks"]
+            for i, arg in enumerate(node.args):
+                if i < len(order) and order[i] in mult:
+                    v = _eval_const(arg)
+                    if isinstance(v, (int, float)):
+                        total += v * mult[order[i]]
+                        matched = True
+            if matched:
+                return int(total)
     # For f-strings, template strings, etc. — return a placeholder
     if isinstance(node, ast.JoinedStr):
         return "<f-string: manual conversion needed>"
