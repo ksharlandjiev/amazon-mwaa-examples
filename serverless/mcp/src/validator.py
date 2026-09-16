@@ -34,7 +34,10 @@ from schema import (
     ABSTRACT_OPERATORS,
     CODE_OPERATORS,
     LONG_WAIT_OPERATOR_PAIRS,
+    MIN_SENSIBLE_POKE_INTERVAL,
     OPERATOR_REQUIRED_PARAMS,
+    RESCHEDULE_CYCLE_OVERHEAD_SECONDS,
+    RESCHEDULE_MODE_SUPPORTED,
     RESCHEDULE_MODE_UNSUPPORTED,
     SENSOR_MODES,
     SUPPORTED_OPERATORS,
@@ -259,8 +262,8 @@ def _validate_dag_level(dag_id, dag_cfg, errors, warnings, hints):
                 if key not in DEFAULT_ARGS_ALLOWLIST:
                     extra = ""
                     if key == "mode":
-                        extra = (" 'mode' has to be set on each sensor task individually — "
-                                 "reschedule mode cannot be applied DAG-wide.")
+                        extra = (" 'mode' has to be set on each sensor task individually — it "
+                                 "cannot be applied DAG-wide.")
                     errors.append(
                         f"DAG '{dag_id}': default_args key '{key}' is not accepted. MWAA Serverless "
                         f"allows only: {', '.join(sorted(DEFAULT_ARGS_ALLOWLIST))}.{extra}"
@@ -506,8 +509,8 @@ def _validate_task_extras(tid, tcfg, warnings, hints):
         warnings.append(
             f"Task '{tid}': deferrable=True has no effect — MWAA Serverless has no triggerer "
             f"(CreateWorkflow returns Warnings: ['ignored attributes: deferrable']). The task runs "
-            f"in normal blocking mode, so remove it. mode: reschedule is not a substitute — it is "
-            f"not supported end to end either. Bound the wait with a timeout instead."
+            f"in normal blocking mode, so remove it. On a sensor, use mode: reschedule instead — "
+            f"that is the mechanism that actually releases the worker between checks."
         )
 
     if "expand" in tcfg or "expand_kwargs" in tcfg:
@@ -515,11 +518,12 @@ def _validate_task_extras(tid, tcfg, warnings, hints):
 
 
 def _validate_sensor_cost(tid, short, tcfg, errors, warnings, hints):
-    """Check the sensor arguments that determine how long a wait holds a worker.
+    """Check the sensor arguments that determine how much a wait costs.
 
-    MWAA Serverless bills for worker occupancy, and neither Airflow mechanism for
-    releasing the worker applies here: `deferrable` is ignored and `mode: reschedule` is
-    not supported end to end. So the checks below steer toward a bounded poke-mode wait.
+    MWAA Serverless bills for worker occupancy. In poke mode a sensor holds its worker
+    for the entire wait; in reschedule mode it exits between checks and releases it.
+    Reschedule is therefore the default the builder applies, gated on
+    RESCHEDULE_MODE_SUPPORTED so this collapses to a single switch if it regresses.
     """
     mode = tcfg.get("mode")
 
@@ -530,7 +534,7 @@ def _validate_sensor_cost(tid, short, tcfg, errors, warnings, hints):
                     f"Task '{tid}': mode={mode!r} is invalid. The service rejects this with "
                     f"\"The mode must be one of {list(SENSOR_MODES)}\"."
                 )
-            elif mode == "reschedule":
+            elif mode == "reschedule" and not RESCHEDULE_MODE_SUPPORTED:
                 errors.append(f"Task '{tid}': {RESCHEDULE_MODE_UNSUPPORTED}")
         elif isinstance(mode, str) and mode in SENSOR_MODES:
             # Only flag a sensor-scheduling value. Some operators (e.g.
@@ -546,14 +550,31 @@ def _validate_sensor_cost(tid, short, tcfg, errors, warnings, hints):
 
     if tcfg.get("timeout") is None:
         hints.append(
-            f"COST: sensor '{tid}' has no timeout, so it defaults to Airflow's 7 days. A sensor "
-            f"holds a worker slot for its entire wait on MWAA Serverless, so an unbounded wait is "
-            f"an unbounded bill. Set timeout to the longest wait that is still useful."
+            f"COST: sensor '{tid}' has no timeout, so it defaults to Airflow's 7 days. The wait "
+            f"is billed, so an unbounded wait is an unbounded bill. Set timeout to the longest "
+            f"wait that is still useful."
+        )
+
+    if RESCHEDULE_MODE_SUPPORTED and mode != "reschedule":
+        hints.append(
+            f"COST: sensor '{tid}' waits in poke mode, which holds a worker slot for the whole "
+            f"wait. Set mode: reschedule so the slot is released between checks — this is the "
+            f"single biggest cost lever in a DAG that waits. Keep poke only for a wait that "
+            f"resolves in a minute or two, where the re-queue overhead is not worth it."
         )
 
     pi = tcfg.get("poke_interval")
-    if pi is not None and (not isinstance(pi, (int, float)) or isinstance(pi, bool) or pi <= 0):
-        errors.append(f"Task '{tid}': poke_interval must be a positive number of seconds.")
+    if pi is not None:
+        if not isinstance(pi, (int, float)) or isinstance(pi, bool) or pi <= 0:
+            errors.append(f"Task '{tid}': poke_interval must be a positive number of seconds.")
+        elif mode == "reschedule" and pi < MIN_SENSIBLE_POKE_INTERVAL:
+            hints.append(
+                f"COST: sensor '{tid}' has poke_interval={pi}s in reschedule mode. Each cycle is "
+                f"a task start and adds roughly {RESCHEDULE_CYCLE_OVERHEAD_SECONDS}s of "
+                f"scheduling overhead, so an interval below {MIN_SENSIBLE_POKE_INTERVAL}s trades "
+                f"worker time for churn without checking meaningfully sooner. 30-120s is the "
+                f"useful range."
+            )
 
     if tcfg.get("exponential_backoff") and tcfg.get("max_wait") is None:
         hints.append(
@@ -563,26 +584,39 @@ def _validate_sensor_cost(tid, short, tcfg, errors, warnings, hints):
 
 
 def _validate_blocking_wait_cost(tid, short, tcfg, hints):
-    """Flag an operator+sensor split that costs more than it saves.
+    """Comment on an operator that blocks on a potentially long job.
 
-    Splitting a job into fire-and-forget plus a sensor is the usual way to avoid holding
-    a worker during a long job, but it only pays off when the waiting task is cheap,
-    which needs reschedule mode. Without it the sensor holds a worker exactly as the
-    operator would have, and the split just adds a task.
+    With reschedule mode available, firing the job and waiting in a reschedule-mode
+    sensor is genuinely cheaper for a long job, because the sensor releases its worker
+    between checks while a blocking operator does not. For a short job the extra task
+    start is not worth it.
     """
-    if tcfg.get("wait_for_completion") is not False:
-        return
     sensor = LONG_WAIT_OPERATOR_PAIRS.get(short)
     if not sensor:
         return
-    hints.append(
-        f"COST: task '{tid}' ({short}) uses wait_for_completion: false, which normally pairs with "
-        f"a {sensor}. Be aware that on MWAA Serverless the sensor holds a worker slot for the whole "
-        f"wait just as the operator would, because reschedule mode is unavailable, so the split "
-        f"costs one extra task start without reducing the billed wait. Prefer "
-        f"wait_for_completion: true unless you need the two steps to be separately retryable, or "
-        f"need the DAG to do something else in parallel."
-    )
+
+    if tcfg.get("wait_for_completion") is True:
+        if RESCHEDULE_MODE_SUPPORTED:
+            hints.append(
+                f"COST: task '{tid}' ({short}) uses wait_for_completion: true, so it occupies a "
+                f"worker slot for as long as the job runs. If that is more than a few minutes, "
+                f"set wait_for_completion: false and add a {sensor} with mode: reschedule — the "
+                f"operator then returns in seconds and the sensor releases its worker between "
+                f"checks. For a short job, leave it as is."
+            )
+        else:
+            hints.append(
+                f"COST: task '{tid}' ({short}) uses wait_for_completion: true, so it occupies a "
+                f"worker slot for as long as the job runs — but so would a {sensor} waiting on "
+                f"it, because reschedule mode is unavailable. Blocking in this one task is the "
+                f"cheaper shape."
+            )
+    elif tcfg.get("wait_for_completion") is False and not RESCHEDULE_MODE_SUPPORTED:
+        hints.append(
+            f"COST: task '{tid}' ({short}) uses wait_for_completion: false, which normally pairs "
+            f"with a {sensor}. With reschedule mode unavailable the sensor holds a worker for the "
+            f"same wait, so the split costs one extra task start without reducing the billed wait."
+        )
 
 
 def _validate_required_params(tid, short, tcfg, errors, hints):
@@ -975,10 +1009,17 @@ def _repair_task(tid, tcfg, changes, unfixable):
     # author clearly wanted a non-blocking wait, so translate it into the thing
     # that actually achieves that.
     if tcfg.pop("deferrable", None) is not None:
-        changes.append(
-            f"Task '{tid}': removed 'deferrable' — MWAA Serverless ignores it and returns an "
-            f"'ignored attributes' warning. There is no working deferral mechanism to swap in."
-        )
+        if RESCHEDULE_MODE_SUPPORTED and is_sensor(tcfg.get("operator")) and "mode" not in tcfg:
+            tcfg["mode"] = "reschedule"
+            changes.append(
+                f"Task '{tid}': replaced 'deferrable' (accepted but ignored — there is no "
+                f"triggerer) with 'mode: reschedule', which does release the worker between checks."
+            )
+        else:
+            changes.append(
+                f"Task '{tid}': removed 'deferrable' — MWAA Serverless ignores it and returns an "
+                f"'ignored attributes' warning."
+            )
 
     # An invalid sensor mode is a hard rejection; drop it back to the default. Only
     # touch `mode` when it is clearly the sensor scheduling argument — several
@@ -990,7 +1031,7 @@ def _repair_task(tid, tcfg, changes, unfixable):
                 changes.append(
                     f"Task '{tid}': removed invalid mode={bad!r} (must be one of {list(SENSOR_MODES)})."
                 )
-            elif tcfg["mode"] == "reschedule":
+            elif tcfg["mode"] == "reschedule" and not RESCHEDULE_MODE_SUPPORTED:
                 tcfg["mode"] = "poke"
                 changes.append(
                     f"Task '{tid}': changed mode from 'reschedule' to 'poke' — reschedule mode is "

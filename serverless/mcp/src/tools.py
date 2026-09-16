@@ -174,12 +174,13 @@ def generate_yaml(dag_id, service, description="", schedule="None", params=None)
 
 
 def _apply_sensor_safety_defaults(tasks):
-    """Bound every sensor's wait unless the template already does.
+    """Apply the sensor cost defaults unless the template already sets them.
 
     These demo templates wait on CloudFormation stacks and Glue jobs, and a sensor
-    holds a worker slot for its entire wait, which MWAA Serverless bills for. Airflow's
-    default timeout is 7 days. `mode` is deliberately untouched: reschedule mode would
-    release the worker but is not currently supported end to end on this service.
+    holds a worker slot for its entire wait, which MWAA Serverless bills for, and
+    Airflow's default timeout is 7 days. Reschedule mode is applied for the same reason:
+    these templates wait on CloudFormation stacks and Glue jobs, exactly the case where
+    holding a worker to poll is pure waste.
     """
     applied = []
     if not isinstance(tasks, dict):
@@ -460,6 +461,7 @@ _OPERATOR_IAM_MAP = {
         "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
         "s3:GetBucketLocation", "s3:CreateBucket", "s3:DeleteBucket",
         "s3:GetBucketTagging", "s3:PutBucketTagging", "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
     ]},
     "s3_tables": {"actions": [
         "s3tables:CreateTableBucket", "s3tables:DeleteTableBucket", "s3tables:CreateNamespace",
@@ -491,7 +493,10 @@ _OPERATOR_IAM_MAP = {
         "athena:StopQueryExecution", "athena:GetWorkGroup", "athena:GetDataCatalog",
         "glue:GetDatabase", "glue:GetTable", "glue:GetPartitions",
         "s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation",
-        "s3:AbortMultipartUpload",
+        # Athena writes results as a multipart upload, so it needs both halves of that
+        # API. Omitting ListMultipartUploadParts surfaces as an opaque "Server error"
+        # from StartQueryExecution with nothing recorded in Athena's query history.
+        "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts",
     ]},
     "bedrock": {"actions": [
         "bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream",

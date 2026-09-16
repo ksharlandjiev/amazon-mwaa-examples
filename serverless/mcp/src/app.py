@@ -96,11 +96,10 @@ def get_serverless_overview() -> str:
     not requested. When a best practice is missing, mention it and ask — do not
     silently include it.
 
-    COST: the service bills for the time a task occupies a worker, so waiting is not
-    free — and neither Airflow mechanism for releasing it applies here. `deferrable: true`
-    is ignored (no triggerer), and `mode: reschedule` is accepted at create time but not
-    supported end to end. Leave sensors in poke mode, always set a timeout, and wait less
-    rather than differently. See authoring_policy.cost_efficiency.
+    COST: the service bills for the time a task occupies a worker, so waiting is not free.
+    Sensors should set `mode: reschedule`, which releases the worker between checks;
+    `deferrable: true` looks like the answer but is ignored, because there is no
+    triggerer. Always bound a wait with a timeout. See authoring_policy.cost_efficiency.
 
     PythonOperator and BashOperator ARE now supported (this changed recently);
     their code is uploaded separately as a code bundle.
@@ -234,14 +233,14 @@ def build_dag_yaml(dag_id: str, tasks: list, schedule: str = "", description: st
 
     COST — this matters and is easy to get wrong. MWAA Serverless bills for the time a
     task occupies a worker, so a task sitting in a poll loop costs the same as one doing
-    real work. Sensors are therefore emitted with a bounded `timeout` (Airflow's default
-    is 7 days); `cost_optimizations_applied` lists what was set.
+    real work. Sensors are therefore emitted with `mode: reschedule`, a `poke_interval`
+    and a bounded `timeout`, which releases the worker between checks. Pass
+    params {"mode": "poke"} only for a wait that resolves in a minute or two.
+    `cost_optimizations_applied` lists what was set.
 
-    Do NOT reach for the usual fixes: `deferrable: true` is ignored (there is no
-    triggerer), and `mode: reschedule` is accepted at create time but is not supported end
-    to end, so the wait never completes. Since the wait is billed either way, prefer ONE
-    operator with wait_for_completion: true over an operator plus a sensor; the split adds
-    a task start and saves nothing.
+    Do NOT use `deferrable: true` — MWAA Serverless has no triggerer and ignores it. For a
+    job running more than a few minutes, prefer wait_for_completion: false on the operator
+    plus a reschedule-mode sensor over a blocking wait.
 
     To pass a value between tasks, reference the upstream task's XCom in a
     downstream argument: "{{ ti.xcom_pull(task_ids='upstream_id') }}", and list that
@@ -280,8 +279,8 @@ def validate_dag_yaml(yaml_content: str) -> str:
     upstream or that pushes nothing, and definitions over the 50 KB limit.
 
     `errors` will break the workflow. `warnings` are attributes the service silently
-    ignores. `hints` are best-practice observations, including COST hints where a wait
-    is unbounded or a task split adds cost without saving any.
+    ignores. `hints` are best-practice observations, including COST hints where a sensor
+    holds a worker longer than it needs to or a wait is unbounded.
 
     If there are mechanical errors, call repair_dag_yaml to fix them automatically.
 
@@ -303,10 +302,9 @@ def repair_dag_yaml(yaml_content: str) -> str:
     values capped, and ignored attributes (aws_conn_id, region_name, catchup, tags)
     removed.
 
-    Cost-related repairs: `mode: reschedule` is downgraded to `poke` (accepted at create
-    time but not supported end to end), `deferrable` is dropped as the service ignores it,
-    `mode` in default_args is pushed down onto the sensor tasks that can accept it, and an
-    invalid `mode` value is removed.
+    Cost-related repairs: `deferrable` on a sensor becomes `mode: reschedule` (the
+    mechanism that actually releases the worker), `mode` in default_args is pushed down
+    onto the sensor tasks that can accept it, and an invalid `mode` value is removed.
 
     Anything needing a human decision — an unknown operator, a missing required
     argument — comes back in `unfixable`.

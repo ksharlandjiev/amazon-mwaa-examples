@@ -22,6 +22,7 @@ from schema import (
     LONG_WAIT_OPERATOR_PAIRS,
     OPERATOR_REQUIRED_PARAMS,
     OPERATOR_XCOM_RETURNS,
+    RESCHEDULE_MODE_SUPPORTED,
     RESCHEDULE_MODE_UNSUPPORTED,
     SENSOR_SAFETY_DEFAULTS,
     SUPPORTED_OPERATORS,
@@ -314,15 +315,17 @@ STEP_CATALOG = {
 # decision, not a style one. Attaching this here (rather than repeating it in each
 # entry) keeps it consistent as the catalog grows.
 _SENSOR_COST_RECOMMENDED = {
-    "timeout": "Seconds before giving up. Airflow defaults to 7 days, and the worker is held for "
-               "the whole wait, so always bound this.",
-    "poke_interval": "Seconds between checks. Affects API call volume, not cost.",
+    "mode": "reschedule — releases the worker slot between checks, so the wait is not billed as "
+            "occupied worker time. Strongly preferred for any wait beyond a couple of minutes.",
+    "poke_interval": "Seconds between checks. Each reschedule cycle is a task start, so 30-120 "
+                     "is the useful range.",
+    "timeout": "Seconds before giving up. Airflow defaults to 7 days and the wait is billed, so "
+               "always bound this.",
 }
 _SENSOR_COST_NOTE = (
-    "COST: a sensor holds a worker slot for its entire wait and MWAA Serverless bills for that. "
-    "Neither Airflow mechanism for releasing it applies here: deferrable: true is ignored (no "
-    "triggerer) and mode: reschedule is not supported end to end. Keep the default poke mode, "
-    "bound it with a timeout, and add the sensor only if you actually need it."
+    "COST: set mode: reschedule so the worker is released between checks, and always bound the "
+    "wait with a timeout. Do NOT use deferrable: true — MWAA Serverless has no triggerer and "
+    "ignores it (CreateWorkflow returns 'ignored attributes: deferrable')."
 )
 
 for _step in STEP_CATALOG.values():
@@ -333,10 +336,10 @@ for _step in STEP_CATALOG.values():
         _step["cost"] = _SENSOR_COST_NOTE
     elif _step.get("operator") in LONG_WAIT_OPERATOR_PAIRS:
         _step["cost"] = (
-            f"COST: wait_for_completion: true holds a worker slot for the whole job, but so would "
-            f"a {LONG_WAIT_OPERATOR_PAIRS[_step['operator']]} waiting on it, since reschedule mode "
-            f"is unavailable. Blocking in this one task is therefore the cheaper shape — add the "
-            f"separate sensor only for independent retries or parallelism."
+            f"COST: wait_for_completion: true holds a worker slot for the whole job. For a job "
+            f"that runs more than a few minutes, prefer wait_for_completion: false plus a "
+            f"{LONG_WAIT_OPERATOR_PAIRS[_step['operator']]} with mode: reschedule, which releases "
+            f"the worker between checks. For a short job, blocking is simpler."
         )
 
 
@@ -422,31 +425,27 @@ def plan_pipeline(steps, has_schedule: bool = False, creates_resources: bool = F
         "billing_model": AUTHORING_POLICY["cost_efficiency"]["principle"],
         "will_be_applied_automatically": [],
         "decisions_that_need_the_user": [],
-        "do_not_use": [
-            AUTHORING_POLICY["cost_efficiency"]["deferrable_does_not_work"],
-            RESCHEDULE_MODE_UNSUPPORTED,
-        ],
+        "do_not_use": [AUTHORING_POLICY["cost_efficiency"]["deferrable_does_not_work"]]
+                      + ([] if RESCHEDULE_MODE_SUPPORTED else [RESCHEDULE_MODE_UNSUPPORTED]),
     }
     if sensor_steps:
         cost_plan["will_be_applied_automatically"].append(
-            f"A bounded timeout on {len(sensor_steps)} sensor step(s) "
-            f"({', '.join(sensor_steps)}). build_dag_yaml does this for you. It does NOT set "
-            f"mode: reschedule, which is unavailable on this service — the wait is billed either "
-            f"way, so the lever is to wait for less time, not to wait differently."
+            f"mode: reschedule, a poke_interval and a bounded timeout on {len(sensor_steps)} "
+            f"sensor step(s) ({', '.join(sensor_steps)}), so the wait releases its worker between "
+            f"checks instead of holding one throughout. build_dag_yaml does this for you."
         )
     for key, short, sensor in blocking_candidates:
         cost_plan["decisions_that_need_the_user"].append(
-            f"'{key}' ({short}): keep wait_for_completion: true unless you need this step and its "
-            f"wait to retry independently, or need other tasks to run in parallel with the wait. "
-            f"Splitting it into a fire-and-forget task plus a {sensor} does not save money here — "
-            f"the sensor holds a worker for the same wait, and you pay for one more task start."
+            f"'{key}' ({short}): how long does this normally take? Under ~5 minutes, keep "
+            f"wait_for_completion: true — one task, simplest. Longer than that, use "
+            f"wait_for_completion: false plus a {sensor} in reschedule mode, so the worker is not "
+            f"held for the whole job."
         )
     if blocking_candidates:
         names = ", ".join(k for k, _, _ in blocking_candidates)
         questions.append(
-            f"Roughly how long do these steps run for: {names}? The wait is billed as worker "
-            f"time, so a long wait is worth knowing about even though the DAG shape cannot "
-            f"currently avoid it."
+            f"Roughly how long do these steps run for: {names}? Anything beyond ~5 minutes is "
+            f"cheaper to wait for in a reschedule-mode sensor than to block on in-task."
         )
 
     return {
@@ -495,10 +494,10 @@ def build_dag_yaml(
         trigger_rule               (optional) e.g. all_done for cleanup tasks
         sensor_timeout_seconds     (optional) sensors only; bounds the wait (default 3600)
 
-    Sensors are emitted with a bounded `timeout` unless the caller sets one, because a
-    sensor holds a worker slot for its whole wait and Airflow's default timeout is 7
-    days. `mode` is left at the default: reschedule mode would release the worker but is
-    not currently supported end to end on this service.
+    Sensors are emitted with `mode: reschedule`, a `poke_interval` and a bounded
+    `timeout` unless the caller sets them, because a poke-mode sensor occupies a worker
+    for its whole wait and Airflow's default timeout is 7 days. Pass
+    `params: {"mode": "poke"}` to opt out for a short wait.
     """
     if isinstance(tasks, dict):
         tasks = [{"task_id": k, **(v or {})} for k, v in tasks.items()]
@@ -599,18 +598,16 @@ def build_dag_yaml(
                 deps = [deps]
             tcfg["dependencies"] = list(deps)
 
-        # Sensors get a bounded wait. `mode` is deliberately NOT set: reschedule mode
-        # would be the way to stop a wait from holding a worker, but it is not supported
-        # end to end here, so the default poke mode is the only shape that completes. A
-        # caller that passes mode explicitly is left alone and the validator reports it.
+        # Sensors get reschedule mode, a poke interval and a bounded wait, so a wait
+        # never silently holds a worker for its full duration. An explicit value always
+        # wins, so `params: {mode: poke}` opts out for a short wait.
         if is_sensor(fqn):
             secs = spec.get("sensor_timeout_seconds")
             for k, v in SENSOR_SAFETY_DEFAULTS.items():
                 if k not in tcfg:
                     tcfg[k] = int(secs) if (k == "timeout" and secs) else v
                     cost_applied.append(
-                        f"Task '{tid}': set {k}: {tcfg[k]} — bounds the wait so an unbounded "
-                        f"one cannot run up an unbounded bill (Airflow's default is 7 days)."
+                        f"Task '{tid}': set {k}: {tcfg[k]} — {_SENSOR_DEFAULT_REASONS.get(k, '')}"
                     )
 
         built[str(tid)] = tcfg
@@ -643,6 +640,17 @@ def build_dag_yaml(
 
 _PLACEHOLDER_HINTS = ("REPLACE", "CHANGEME", "your-", "my-bucket", "example", "amzn-s3-demo",
                       "111122223333", "<", "TODO", "xxx")
+
+# Why each sensor default is applied, so the report explains itself rather than
+# repeating one message that only fits `timeout`.
+_SENSOR_DEFAULT_REASONS = {
+    "mode": "releases the worker slot between checks instead of holding one for the whole "
+            "wait, which is what MWAA Serverless bills for. Pass mode: poke to opt out.",
+    "poke_interval": "seconds between checks; each reschedule cycle is a task start, so "
+                     "30-120s is the useful range.",
+    "timeout": "bounds the wait, so a stuck upstream job cannot run up an unbounded bill "
+               "(Airflow's default is 7 days).",
+}
 
 
 def _collect_placeholder_warnings(tasks) -> list:

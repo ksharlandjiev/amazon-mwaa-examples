@@ -133,35 +133,13 @@ MWAA Serverless bills for the time a task occupies a worker. A sensor that sits 
 loop for 20 minutes costs the same as 20 minutes of real work, so *how* a DAG waits is a
 pricing decision.
 
-Airflow has two mechanisms for waiting without holding a worker, and neither is available
-on MWAA Serverless today:
+**The lever is `mode: reschedule` on sensors.** In the default `poke` mode a sensor holds
+its worker slot for the entire wait. In `reschedule` mode the task exits after each check
+and is re-queued, so nothing is held in between.
 
-| Mechanism | Status |
-|---|---|
-| `mode: reschedule` | Accepted and enum-validated by `CreateWorkflow`, but not supported end to end — the wait does not resume, so the task never completes. |
-| `deferrable: true` | Accepted and then ignored; `CreateWorkflow` reports it under `Warnings: ['ignored attributes: deferrable']`. There is no triggerer. |
-
-Both are worth knowing about because both look supported at author time. The server
-therefore leaves sensors in the default poke mode: `build_dag_yaml` does not emit
-`mode: reschedule`, `validate_dag_yaml` reports it as an error, and `repair_dag_yaml`
-downgrades it to `poke` and drops `deferrable`.
-
-### What actually reduces the bill
-
-Since every wait is billed as worker time regardless of how it is written, the lever is to
-**wait less**, not to wait differently.
-
-- **Always set a `timeout`.** Airflow's default is 7 days, and the worker is held for the
-  whole wait, so an unbounded wait is an unbounded bill. `build_dag_yaml` sets one for every
-  sensor and reports it in `cost_optimizations_applied`.
-- **Prefer one operator with `wait_for_completion: true`** over an operator plus a sensor.
-  The split is the usual way to make a long wait cheap, but it depends on reschedule mode;
-  without it the sensor holds a worker for exactly the same wait and you pay for one more
-  task start. Split them only when you need the steps to retry independently, or need other
-  tasks to run in parallel with the wait.
-- **Push long waits into the service being orchestrated.** A Glue job that waits on its own
-  dependency burns Glue time, not Airflow worker time.
-- `poke_interval` affects API call volume, not cost. There is no need to tune it for spend.
+`build_dag_yaml` applies this automatically — every sensor is emitted with
+`mode: reschedule`, a `poke_interval` and a `timeout`, and the response lists what it set
+in `cost_optimizations_applied`:
 
 ```yaml
 wait_transform:
@@ -169,19 +147,47 @@ wait_transform:
   job_name: '{{ params.glue_job }}'
   run_id: "{{ ti.xcom_pull(task_ids='transform_orders') }}"
   dependencies: [transform_orders]
-  # no `mode:` — the default poke mode is the only one that completes
-  poke_interval: 60
-  timeout: 3600         # ALWAYS bound the wait
+  mode: reschedule      # released between checks instead of held for the whole wait
+  poke_interval: 60     # each cycle is a task start — 30-120s is the useful range
+  timeout: 3600         # ALWAYS bound the wait; Airflow's default is 7 days
 ```
 
-`plan_pipeline` returns a `cost_plan` covering all of this: what it applies automatically,
-what it will not do and why, and the question only the user can answer (how long each job
-runs). `mode` also cannot be set in `default_args` — it is not in the service's allowlist.
+Pass `params: {"mode": "poke"}` to opt out for a wait that resolves in a minute or two,
+where the re-queue overhead is not worth it. The validator emits a `COST:` hint whenever a
+sensor is left in poke mode.
 
-> Service support changes. When reschedule mode works end to end, flip
-> `schema.RESCHEDULE_MODE_SUPPORTED` and revisit
-> `AUTHORING_POLICY["cost_efficiency"]` — those two places drive the validator, the
-> builder and the repair path.
+### `deferrable: true` is a trap
+
+The usual Airflow answer does not apply here. MWAA Serverless has **no triggerer**:
+`CreateWorkflow` accepts `deferrable: true` and returns
+`Warnings: ['ignored attributes: deferrable']`, then runs the task in blocking mode anyway,
+so a DAG that looks cost-optimised is not. `repair_dag_yaml` rewrites `deferrable` on a
+sensor into `mode: reschedule`.
+
+### Reschedule cycles are not free
+
+A cycle is a task start, and measured end to end it adds roughly **45 s** of scheduling
+overhead on top of `poke_interval` — a 30 s interval behaves like a ~75 s one. Keep
+`poke_interval` between 30 and 120 s; below that you pay churn without checking sooner.
+
+### Long-running jobs: fire and watch, don't block
+
+`wait_for_completion: true` keeps a worker for the job's full duration. For anything longer
+than a few minutes it is cheaper to return immediately and wait in a reschedule-mode sensor:
+
+| Job duration | Cheaper shape |
+|---|---|
+| Seconds to ~5 min | One operator with `wait_for_completion: true`. The extra task is not worth it. |
+| Longer than that | `wait_for_completion: false` + a paired sensor with `mode: reschedule`. |
+
+Only the user knows which case applies, so `plan_pipeline` returns a `cost_plan` with the
+question rather than guessing, and lists what it will apply automatically. `mode` cannot be
+set in `default_args` — it is not in the service's allowlist, so it goes on each sensor
+task; `repair_dag_yaml` moves a misplaced one down onto the sensors.
+
+> Reschedule support is gated on a single flag, `schema.RESCHEDULE_MODE_SUPPORTED`. Set it
+> to `False` and the builder stops emitting `mode`, the validator reports it as an error,
+> and repair downgrades it to `poke` — the guidance follows from that one place.
 
 ## Recommended flow
 

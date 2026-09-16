@@ -53,6 +53,7 @@ YAML_SCHEMA = {
       operator: airflow.providers.amazon.aws.sensors.athena.AthenaSensor
       # pass a value produced by an upstream task via XCom:
       query_execution_id: "{{ ti.xcom_pull(task_ids='run_query') }}"
+      mode: reschedule           # COST: releases the worker slot between checks
       poke_interval: 60          # seconds between checks
       timeout: 3600              # ALWAYS bound a wait; Airflow defaults to 7 days
       dependencies: [run_query]
@@ -128,14 +129,15 @@ YAML_SCHEMA = {
             "verified": "start_date: '2024-01-01' created successfully.",
         },
         {
-            "rule": "COST: `mode: reschedule` is accepted by CreateWorkflow but is not currently "
-                    "supported end to end — the wait does not resume, so the task never completes. "
-                    "Leave sensors in the default poke mode. `deferrable: true` is not an "
-                    "alternative either: it is accepted and then ignored, as there is no triggerer.",
+            "rule": "COST: `mode: reschedule` releases the worker between checks and is the "
+                    "primary cost lever for any wait beyond a couple of minutes. `deferrable: true` "
+                    "is NOT an alternative — it is accepted and then ignored, as there is no "
+                    "triggerer.",
             "verified": "Create time: mode: reschedule -> ACCEPTED; mode: poke -> ACCEPTED; "
                         "mode: nonsense -> \"The mode must be one of ['poke', 'reschedule']\". "
-                        "End to end: a poke-mode sensor completes normally; the same definition in "
-                        "reschedule mode does not.",
+                        "End to end: a reschedule-mode sensor pokes repeatedly within one attempt, "
+                        "reports UP_FOR_RESCHEDULE between checks, and honours its timeout. Each "
+                        "cycle adds roughly 45s of scheduling overhead on top of poke_interval.",
         },
         {
             "rule": "COST: `mode` cannot go in `default_args` — it is not in the allowlist, so it must be "
@@ -486,34 +488,33 @@ AUTHORING_POLICY = {
             "20 minutes sleeping in a poll loop costs the same as 20 minutes of real work. "
             "Waiting should therefore be done in a way that releases the worker."
         ),
-        "neither_wait_mechanism_is_available": (
-            "Airflow offers two ways to wait without holding a worker and neither applies on MWAA "
-            "Serverless today. mode: reschedule is accepted by CreateWorkflow and enum-checked, but "
-            "is not supported end to end: the wait does not resume, so the task never completes. "
-            "deferrable: true is accepted and then ignored, because there is no triggerer. Both are "
-            "checked against the live service; see schema.RESCHEDULE_MODE_SUPPORTED."
+        "the_one_lever_that_works": (
+            "mode: reschedule on the sensor. In poke mode (the default) the sensor holds its worker "
+            "slot for the entire wait. In reschedule mode the task exits after each check and is "
+            "re-queued, so nothing is held in between. Gated on "
+            "schema.RESCHEDULE_MODE_SUPPORTED, which is verified against the live service."
         ),
         "deferrable_does_not_work": (
             "deferrable: true is the usual Airflow answer and it does not apply here. MWAA "
             "Serverless has no triggerer: CreateWorkflow accepts the argument and returns "
             "Warnings: ['ignored attributes: deferrable'], then runs the task in blocking mode "
-            "anyway. mode: reschedule is not a substitute — it is unavailable too."
+            "anyway. Use mode: reschedule instead."
         ),
-        "so_the_real_lever_is_to_wait_less": (
-            "Since every wait is billed as worker time regardless of how it is expressed, reduce "
-            "the amount of waiting rather than trying to make waiting cheap."
+        "reschedule_cycle_overhead": (
+            "A reschedule cycle is a task start, and measured end to end it adds roughly 45s on "
+            "top of poke_interval. So a 30s interval behaves like a ~75s one. Keep poke_interval "
+            "in the 30-120s range: below that you pay scheduling churn without checking sooner."
         ),
         "rules": [
-            "Leave sensors in the default poke mode. Do not set mode: reschedule — it is not "
-            "supported end to end, so the task never completes.",
-            "ALWAYS set a timeout on a sensor. Airflow's default is 7 days, and the worker is "
-            "held for the whole wait, so an unbounded wait is an unbounded bill.",
-            "Prefer ONE operator with wait_for_completion: true over an operator plus a sensor. "
-            "The blocking wait costs the same as the sensor would, and it is one task instead of "
-            "two. Split them only for independent retries or genuine parallelism.",
+            "Any sensor expected to wait more than ~2 minutes SHOULD set mode: reschedule.",
+            "ALWAYS set a timeout on a sensor. Airflow's default is 7 days, and the wait is "
+            "billed, so an unbounded wait is an unbounded bill.",
+            "For a LONG job, prefer wait_for_completion: false plus a reschedule-mode sensor over "
+            "wait_for_completion: true — the operator returns in seconds and only the cheap "
+            "sensor waits. For a SHORT job, blocking in one task is simpler and cheaper.",
             "Do not add a sensor that duplicates an operator's own wait.",
-            "poke_interval changes API call volume, not cost. There is no need to tune it for "
-            "spend; 60s is a fine default.",
+            "Keep poke_interval between 30 and 120 seconds; each reschedule cycle is a task "
+            "start plus about 45s of scheduling overhead.",
             "Push long waits into the service being orchestrated where you can — a Glue job that "
             "polls its own dependency costs Glue time, not Airflow worker time.",
             "exponential_backoff: true with max_wait is accepted and reduces API chatter on an "
@@ -521,10 +522,10 @@ AUTHORING_POLICY = {
             "mode cannot be set in default_args (not in the allowlist) — which is moot, since it "
             "should not be set at all.",
         ],
-        "when_reschedule_becomes_available": (
-            "mode: reschedule would become the primary lever: the task exits between checks and "
-            "releases the worker. Re-test a multi-poke wait end to end, then flip "
-            "schema.RESCHEDULE_MODE_SUPPORTED."
+        "if_reschedule_regresses": (
+            "Set schema.RESCHEDULE_MODE_SUPPORTED = False. The builder stops emitting mode, the "
+            "validator reports it as an error, and repair downgrades it to poke — the guidance "
+            "follows from that one flag."
         ),
     },
     "correctness_checklist": [
@@ -537,16 +538,15 @@ AUTHORING_POLICY = {
         "retry_delay is an integer; execution_timeout is a __type__ timedelta mapping under 60 minutes.",
         "No aws_conn_id / region_name / verify / botocore_config.",
         "Cleanup tasks (only for resources this DAG created) set trigger_rule: all_done.",
-        "Every sensor sets a timeout, and no sensor sets mode: reschedule.",
+        "Every sensor that may wait more than ~2 minutes sets mode: reschedule and a timeout.",
         "The definition is under 50 KB.",
     ],
     "best_practices": [
         "Parameterise every environment-specific value with {{ params.x }} and give it a default.",
-        "Prefer one operator that waits (wait_for_completion: true) over an operator plus a "
-        "sensor. The wait is billed as worker time either way, so the split adds a task start "
-        "without saving anything. Split only for independent retries or real parallelism.",
-        "Always bound a sensor with a timeout, and leave it in the default poke mode. See the "
-        "cost_efficiency policy for why reschedule mode is not an option here.",
+        "For a SHORT job (under ~5 minutes) prefer one operator that waits "
+        "(wait_for_completion: true) — simpler, and the blocked time is cheap.",
+        "For a LONG job, use wait_for_completion: false plus a sensor with mode: reschedule, so "
+        "the worker is released between checks. See the cost_efficiency policy.",
         "Set max_active_runs: 1 for pipelines that write to a shared destination.",
         "Keep retries low (0-3) and retry_delay short; MWAA Serverless caps both.",
         "Put the long tail of work in the service being orchestrated (Glue, EMR, Athena), not "

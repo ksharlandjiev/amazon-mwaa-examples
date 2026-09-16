@@ -290,24 +290,25 @@ CODE_OPERATORS = {"PythonOperator", "BashOperator"}
 #  SENSOR COST CONTROL
 # ══════════════════════════════════════════════════════════════════════════
 # How a sensor waits matters, because MWAA Serverless bills for the time a task
-# occupies a worker. Two Airflow features look like they address this and currently
-# do not apply here:
+# occupies a worker.
 #
-#   mode: reschedule  Accepted and enum-validated at create time, but not supported
-#                     end to end — the wait does not resume. Leave sensors in the
-#                     default poke mode.
+#   mode: reschedule  The task exits after each check and is re-queued, so the worker
+#                     is released in between. This is the primary cost lever and the
+#                     default the builder applies. Gated on
+#                     RESCHEDULE_MODE_SUPPORTED, which is checked against the live
+#                     service; set it False if a region regresses.
 #   deferrable: true  Accepted and then ignored; CreateWorkflow reports it under
-#                     Warnings: ['ignored attributes: deferrable'].
+#                     Warnings: ['ignored attributes: deferrable']. There is no
+#                     triggerer, so this is never an alternative.
 #
-# Both are re-checked periodically against the live service; see SENSOR_MODE_SUPPORT
-# for the single place to update when that changes. Until then the lever is to wait
-# less rather than to wait differently: fewer sensors, bounded timeouts, and letting
-# an operator's own wait_for_completion block instead of adding a second task.
+# A bounded `timeout` matters either way: Airflow's default is 7 days and the wait is
+# billed, so an unbounded wait is an unbounded bill.
 SENSOR_MODES = ("poke", "reschedule")
 
-# Whether reschedule mode can be used. Flip this to True (and drop the message) once
-# the service supports it, and the validator, builder and repair paths follow.
-RESCHEDULE_MODE_SUPPORTED = False
+# Whether reschedule mode can be used. This flag drives real behaviour: the builder's
+# sensor defaults, the validator's verdict on `mode: reschedule`, and the repair path.
+# Set it to False if a region regresses, and the guidance follows automatically.
+RESCHEDULE_MODE_SUPPORTED = True
 
 RESCHEDULE_MODE_UNSUPPORTED = (
     "mode: reschedule is accepted at create time but is not currently supported end to "
@@ -315,11 +316,18 @@ RESCHEDULE_MODE_UNSUPPORTED = (
     "Use the default poke mode and bound it with a timeout."
 )
 
-# Sensor arguments the service accepts. `mode` is deliberately absent from the
-# defaults applied by the builder — see RESCHEDULE_MODE_SUPPORTED.
+# One reschedule cycle costs a task start and, measured end to end, roughly 45s of
+# scheduling overhead on top of poke_interval. So a very short interval buys little
+# and churns a lot; 30-120s is the useful range.
+RESCHEDULE_CYCLE_OVERHEAD_SECONDS = 45
+MIN_SENSIBLE_POKE_INTERVAL = 30
+
+# Sensor arguments the service accepts and that matter for cost.
 SENSOR_COST_PARAMS = {
-    "poke_interval": "Seconds between checks. Lower means more API calls; it does not "
-                     "reduce cost, because the worker is held either way.",
+    "mode": "reschedule releases the worker between checks; poke holds it for the whole "
+            "wait. Prefer reschedule for anything longer than a couple of minutes.",
+    "poke_interval": "Seconds between checks. Each reschedule cycle is a task start, so "
+                     "30-120 is the useful range.",
     "timeout": "Seconds (or a __type__ timedelta mapping) before the sensor gives up. "
                "Airflow's default is 7 days, which on a billed platform is a real hazard.",
     "soft_fail": "true to mark the task SKIPPED instead of FAILED on timeout.",
@@ -327,12 +335,16 @@ SENSOR_COST_PARAMS = {
     "max_wait": "Upper bound on the interval when exponential_backoff is on.",
 }
 
-# Applied to sensors by the builder. Only a bounded wait — nothing that changes how
-# the task is scheduled, and nothing the caller did not ask for beyond safety.
-SENSOR_SAFETY_DEFAULTS = {"timeout": 3600}
+# Applied to sensors by the builder. Reschedule mode is the primary cost lever, so it is
+# the default when the service supports it; the bounded timeout applies either way.
+SENSOR_SAFETY_DEFAULTS = (
+    {"mode": "reschedule", "poke_interval": 60, "timeout": 3600}
+    if RESCHEDULE_MODE_SUPPORTED
+    else {"timeout": 3600}
+)
 
-# Operators whose own blocking wait would otherwise tempt an author into adding a
-# second sensor task. Maps operator -> the sensor that would pair with it.
+# Operators whose own blocking wait can be replaced by a cheaper fire-and-forget plus
+# a reschedule-mode sensor. Maps operator -> the sensor that pairs with it.
 LONG_WAIT_OPERATOR_PAIRS = {
     "GlueJobOperator": "GlueJobSensor",
     "GlueCrawlerOperator": "GlueCrawlerSensor",
