@@ -1,7 +1,18 @@
-PyYAML>=6.0
-awslabs.mcp_lambda_handler
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Lambda runtime dependencies, pinned with compatible-release (~=) constraints so a
+# deploy months from now resolves the same way this one did. An unbounded floor like
+# `boto3>=1.40.0` means every `sam build` can pull a different major version.
+
 # boto3 >= 1.40 registers the service as "mwaa-serverless" and exposes the
 # CreateWorkflow/UpdateWorkflow `Code` parameter, which is required to deploy
 # workflows containing PythonOperator or BashOperator tasks. Older releases only
 # expose "airflow-serverless" without Code support.
-boto3>=1.40.0
+boto3~=1.40
+
+PyYAML~=6.0
+
+# The MCP request/response handler for Lambda. Pinned to the minor series that
+# exposes the `tools` and `tool_implementations` registries local_server.py reads.
+awslabs.mcp-lambda-handler~=0.1.15

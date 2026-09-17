@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """
 Code bundles for PythonOperator and BashOperator tasks.
 
@@ -126,13 +129,13 @@ def _analyse_python(name: str, source: str) -> dict:
                 )
             has_kwargs = node.args.kwarg is not None
             argnames = {a.arg for a in node.args.args}
-            if not has_kwargs and not (argnames & {"context", "ti", "task_instance", "kwargs"}):
-                if node.args.args:
-                    warnings.append(
-                        f"'{name}.{node.name}' takes positional arguments and no **kwargs. "
-                        f"PythonOperator passes the Airflow context as keyword arguments — add "
-                        f"**context, or supply the values via op_kwargs."
-                    )
+            if (not has_kwargs and node.args.args
+                    and not (argnames & {"context", "ti", "task_instance", "kwargs"})):
+                warnings.append(
+                    f"'{name}.{node.name}' takes positional arguments and no **kwargs. "
+                    f"PythonOperator passes the Airflow context as keyword arguments — add "
+                    f"**context, or supply the values via op_kwargs."
+                )
 
     for node in ast.walk(tree):
         mod = None
@@ -177,7 +180,7 @@ def check_dag_code_consistency(yaml_content: str, files=None) -> dict:
 
     errors, warnings, required_callables, bash_tasks = [], [], [], []
 
-    for dag_id, dag_cfg in data.items():
+    for dag_cfg in data.values():
         tasks = (dag_cfg or {}).get("tasks")
         if not isinstance(tasks, dict):
             continue

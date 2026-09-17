@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 .aws-sam/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
 
 # Local runtime config — copy mcp_config.example.json and edit; never commit it
 src/mcp_config.json

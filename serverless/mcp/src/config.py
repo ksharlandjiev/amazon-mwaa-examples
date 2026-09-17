@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """
 Runtime configuration, resolved from three layers.
 
@@ -112,7 +115,7 @@ def load(refresh: bool = False) -> dict:
         return _cache
 
     settings = dict(DEFAULTS)
-    sources = {k: "default" for k in DEFAULTS}
+    sources = dict.fromkeys(DEFAULTS, "default")
     problems = []
 
     file_settings, file_path, file_error = _load_file()
