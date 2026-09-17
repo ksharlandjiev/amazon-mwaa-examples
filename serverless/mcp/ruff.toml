@@ -1,0 +1,25 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+#     ruff check .
+#
+# Line length is not enforced: much of src/ is verified reference text (schema rules,
+# service error messages, IAM action lists) where reflowing hurts readability.
+
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B", "S", "ARG", "SIM", "C4", "RET", "PIE"]
+ignore = [
+    # Reported to the caller as JSON rather than raised. Every one of these carries a
+    # `# noqa: BLE001` with the reason at the call site.
+    "BLE001",
+]
+
+[lint.per-file-ignores]
+# Test doubles must accept the real API's signature even when a given test ignores an
+# argument, pytest fixtures are often requested purely for their side effect
+# (monkeypatching a module-level client), and PyYAML's multi-constructor signature is
+# fixed. ARG is noise in all three cases.
+"tests/*" = ["ARG001", "ARG002", "ARG005", "S101"]
