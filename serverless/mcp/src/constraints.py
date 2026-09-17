@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """
 Amazon MWAA Serverless ground truth: YAML schema, Jinja support, DAG/task
 parameters, quotas, and DAG authoring policy.
@@ -202,9 +205,13 @@ VALIDATED_DAG_PARAMS = {
 }
 
 # DAG-level keys accepted by the service (structural or validated).
+# max_active_runs and max_active_tasks are deliberately NOT here: the service returns
+# them under CreateWorkflow's `Warnings` as "ignored attributes", so they belong in
+# SILENTLY_IGNORED_DAG_KEYS only. Listing a key in both sets made the validator emit a
+# warning saying the field is ignored AND an error checking it against a quota.
 ACCEPTED_DAG_KEYS = {
     "tasks", "params", "default_args", "schedule",
-    "start_date", "end_date", "max_active_runs", "max_active_tasks",
+    "start_date", "end_date",
 }
 
 # Keys the service accepts without complaint but reports in the CreateWorkflow
@@ -248,6 +255,13 @@ DEFAULT_ARGS_ALLOWLIST = {
 # NOTE: `trigger_rule` and `deferrable` appear in the docs' unsupported table but
 # behave differently in practice — see YAML_SCHEMA["rules"]. They are handled
 # specially by the validator and deliberately excluded from this set.
+#
+# SCOPE MATTERS. These six keys are also in DEFAULT_ARGS_ALLOWLIST:
+#   email, end_date, owner, priority_weight, start_date, wait_for_downstream
+# That is not a contradiction — the sets describe different POSITIONS in the YAML.
+# The service accepts them under `default_args` and ignores them on an individual
+# task. DEFAULT_ARGS_ALLOWLIST_ONLY below names them explicitly so the overlap is
+# intentional and testable rather than something a reader has to infer.
 IGNORED_TASK_PARAMS = {
     "email_on_retry", "email_on_failure", "retry_exponential_backoff",
     "depends_on_past", "ignore_first_depends_on_past", "wait_for_downstream",
@@ -263,6 +277,10 @@ IGNORED_TASK_PARAMS = {
     "weight_rule", "queue", "pool", "pool_slots", "pre_execute",
     "post_execute", "executor", "task_group", "task_group_name",
 }
+
+# Accepted inside `default_args`, ignored when set directly on a task. Kept as its own
+# name so a test can assert the overlap is exactly this set and nothing has drifted.
+DEFAULT_ARGS_ALLOWLIST_ONLY = DEFAULT_ARGS_ALLOWLIST & IGNORED_TASK_PARAMS
 
 # ── AWS base operator attributes ──
 AWS_BASE_OPERATOR_ATTRS = {
@@ -426,6 +444,10 @@ QUOTAS = {
     "max_task_execution_timeout_minutes": 60,
     "max_retries_per_task": 3,
     "max_retry_delay_seconds": 300,
+    # Not a published service quota. It is an analysis bound: a definition must fit
+    # in max_dag_definition_kb, so a task count far above this cannot be a real DAG,
+    # and refusing it early keeps the validator's graph walks bounded.
+    "max_tasks_per_workflow": 1000,
 }
 
 # ══════════════════════════════════════════════════════════════════════════

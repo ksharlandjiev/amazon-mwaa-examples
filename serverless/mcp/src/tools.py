@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """YAML generation for MWAA Serverless DAG factory definitions.
 
 Validation lives in validator.py; structured assembly lives in builder.py.
@@ -9,7 +12,7 @@ actually accepts.
 import re
 import yaml
 import validator
-from schema import (SUPPORTED_OPERATORS, ALLOWED_OPERATOR_VALUES, OPERATOR_REQUIRED_PARAMS,
+from schema import (SUPPORTED_OPERATORS, OPERATOR_REQUIRED_PARAMS,
                     OPERATOR_XCOM_RETURNS, SENSOR_SAFETY_DEFAULTS, is_sensor)
 from constraints import (
     SUPPORTED_JINJA_VARIABLES, SUPPORTED_MACROS,
@@ -88,7 +91,7 @@ def _replace_cfn_output_xcoms(tasks, params):
     """
     introduced = []
 
-    def _fix(value, owner_task, field):
+    def _fix(value, field):
         if not isinstance(value, str):
             return value
 
@@ -103,36 +106,46 @@ def _replace_cfn_output_xcoms(tasks, params):
 
         return _CFN_OUTPUT_XCOM_RE.sub(_sub, value)
 
-    def _walk(node, owner_task, field):
+    def _walk(node, field):
         if isinstance(node, dict):
             for k, v in list(node.items()):
                 if isinstance(v, str):
-                    node[k] = _fix(v, owner_task, k)
+                    node[k] = _fix(v, k)
                 else:
-                    _walk(v, owner_task, k)
+                    _walk(v, k)
         elif isinstance(node, list):
             for i, v in enumerate(node):
                 if isinstance(v, str):
-                    node[i] = _fix(v, owner_task, field)
+                    node[i] = _fix(v, field)
                 else:
-                    _walk(v, owner_task, field)
+                    _walk(v, field)
 
-    entries = tasks.items() if isinstance(tasks, dict) else enumerate(tasks)
-    for tid, tcfg in entries:
+    entries = tasks.values() if isinstance(tasks, dict) else tasks
+    for tcfg in entries:
         if isinstance(tcfg, dict):
-            _walk(tcfg, tid, "value")
+            _walk(tcfg, "value")
     return introduced
 
 
 
 
 def generate_yaml(dag_id, service, description="", schedule="None", params=None):
-    """Produce a runnable, self-contained demo DAG for one AWS service.
+    """Produce a demo DAG for one AWS service, to try that service out end to end.
 
-    These templates provision their own prerequisites and tear them down, so they
-    run in an empty account. That makes them useful for trying a service out and a
-    poor starting point for a real pipeline — a real pipeline should reference
-    resources that already exist. Use plan_pipeline + build_dag_yaml for that.
+    These templates provision their own prerequisites with CloudFormation and tear them
+    down again, so they are a poor starting point for a real pipeline — a real pipeline
+    should reference resources that already exist. Use plan_pipeline + build_dag_yaml
+    for that.
+
+    ALWAYS CHECK `params_you_must_set` IN THE RESPONSE. Only about half the templates are
+    fully self-contained. For the rest, the DAG needs an identifier the stack itself
+    GENERATES — a !Ref'd bucket name, a !GetAtt role ARN — and those cannot be known
+    before the stack is created. CloudFormationCreateStackOperator returns None via XCom
+    (verified against the live service), so reading stack Outputs from it fails at run
+    time; the reference is therefore surfaced as a param with a REPLACE_ME default. A
+    template with entries in `params_you_must_set` will provision its stack, fail the
+    work task on the placeholder, and tear the stack down again unless you supply real
+    values first.
     """
     templates = _get_service_templates()
     svc = service.lower().replace(" ", "_")
@@ -140,11 +153,9 @@ def generate_yaml(dag_id, service, description="", schedule="None", params=None)
         return {"error": f"Unknown service '{service}'. Available: {', '.join(sorted(templates.keys()))}"}
 
     t = templates[svc]
-    tasks = _resolve_operator_fqns(t["tasks"])
-    tasks = _normalize_tasks_to_dict(tasks)
-    _apply_sensor_safety_defaults(tasks)
+    tasks = _prepare_template_tasks(t)
     resolved_params = dict(params or t.get("default_params") or {})
-    introduced = _replace_cfn_output_xcoms(tasks, resolved_params)
+    _replace_cfn_output_xcoms(tasks, resolved_params)
     dag = {dag_id: {"schedule": schedule if schedule not in ("None", "none", "") else None,
                     "tasks": tasks}}
     for k, v in t.get("extra_fields", {}).items():
@@ -162,13 +173,28 @@ def generate_yaml(dag_id, service, description="", schedule="None", params=None)
         "resources, call plan_pipeline then build_dag_yaml instead." % svc
     )
     out = _finalise(dag, note=note)
-    if introduced:
-        out["params_you_must_set"] = introduced
+    out["resource_naming"] = (
+        "Every resource this demo creates is named with a '{{ ts_nodash }}' suffix, so the name "
+        "is unique to the run that creates it. That is what makes the trigger_rule: all_done "
+        "cleanup tasks safe: they can only ever delete a stack or bucket this run just created, "
+        "never a pre-existing resource of yours that happened to share the default name."
+    )
+    # Any REPLACE_ME_ default is a value only the customer can supply. Report all of
+    # them together — a placeholder that stays in the definition fails at run time,
+    # and a plausible-looking default (an ECR URI, a docs example bucket) is worse
+    # because it looks like it should work.
+    placeholders = sorted(
+        k for k, v in resolved_params.items()
+        if isinstance(v, str) and "REPLACE_ME" in v
+    )
+    if placeholders:
+        out["params_you_must_set"] = placeholders
         out["params_note"] = (
-            "These params replaced references to CloudFormation stack outputs. "
+            "Each of these is a placeholder the demo cannot know: a stack output that only "
+            "exists after the stack is created, or a Region-specific identifier. "
             "CloudFormationCreateStackOperator returns None via XCom, so reading stack Outputs "
-            "from it fails at run time. Set each param to the real resource identifier the stack "
-            "creates (or to an existing resource) before deploying."
+            "from it fails at run time — that is why they are params. Set every one to a real "
+            "value before deploying."
         )
     return out
 
@@ -199,7 +225,7 @@ def _normalize_tasks_to_dict(tasks):
     """Convert list-format tasks to dict-format and flatten 'parameters' into task body."""
     if isinstance(tasks, dict):
         # Already dict format — just flatten any nested 'parameters'
-        for tid, tcfg in tasks.items():
+        for tcfg in tasks.values():
             _flatten_parameters(tcfg)
         return tasks
     if not isinstance(tasks, list):
@@ -248,6 +274,48 @@ def list_operators(service_filter=""):
     return [{"name": k, "fqn": v} for k, v in SUPPORTED_OPERATORS.items() if not filt or filt in k.lower() or filt in v.lower()]
 
 
+def _prepare_template_tasks(template):
+    """The one preparation path every demo template goes through.
+
+    Order matters: resolve short operator names to FQNs, normalise the two task shapes
+    the templates are written in, drop attributes the service rejects, apply sensor
+    cost defaults, then make demo-owned resource names run-unique.
+
+    Having a single function for this is the point. get_service_tasks() used to skip
+    the cleanup step, so callers of that tool got back tasks still carrying
+    aws_conn_id, emr_conn_id and a redundant inner task_id — attributes the service
+    either ignores or chokes on.
+    """
+    tasks = _resolve_operator_fqns(template["tasks"])
+    tasks = _normalize_tasks_to_dict(tasks)
+    _strip_service_rejected_task_keys(tasks)
+    _apply_sensor_safety_defaults(tasks)
+    _uniquify_owned_resource_names(tasks)
+    return tasks
+
+
+# Connection-style attributes MWAA Serverless has no way to honour: it supports no
+# Airflow Connections, so an *_conn_id is either ignored or looked up and fails.
+_CONN_ID_RE = re.compile(r"^\w*_?conn_id$")
+
+
+def _strip_service_rejected_task_keys(tasks):
+    """Remove per-task keys the service ignores or rejects. Returns what was removed."""
+    removed = []
+    entries = tasks.items() if isinstance(tasks, dict) else enumerate(tasks)
+    for tid, tcfg in entries:
+        if not isinstance(tcfg, dict):
+            continue
+        # The mapping key IS the task_id; a repeated inner one is redundant.
+        if "task_id" in tcfg:
+            tcfg.pop("task_id")
+            removed.append(f"{tid}.task_id")
+        for key in [k for k in tcfg if _CONN_ID_RE.match(k)]:
+            tcfg.pop(key)
+            removed.append(f"{tid}.{key}")
+    return removed
+
+
 def get_service_tasks(service):
     """Return the task definitions for a single service as a reusable block."""
     templates = _get_service_templates()
@@ -255,9 +323,7 @@ def get_service_tasks(service):
     if svc not in templates:
         return {"error": f"Unknown service '{service}'. Available: {', '.join(sorted(templates.keys()))}"}
     t = templates[svc]
-    tasks = _resolve_operator_fqns(t["tasks"])
-    tasks = _normalize_tasks_to_dict(tasks)
-    _apply_sensor_safety_defaults(tasks)
+    tasks = _prepare_template_tasks(t)
     return {
         "service": svc,
         "tasks": tasks,
@@ -296,9 +362,7 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
             return {"error": f"Unknown service '{svc}'. Available: {', '.join(sorted(templates.keys()))}"}
 
         t = templates[svc]
-        tasks = _resolve_operator_fqns(t["tasks"])
-        tasks = _normalize_tasks_to_dict(tasks)
-        _apply_sensor_safety_defaults(tasks)
+        tasks = _prepare_template_tasks(t)
 
         # Prefix all task IDs and rewrite dependency references
         old_to_new = {}
@@ -312,10 +376,13 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
         for tid, tcfg in tasks.items():
             new_tid = old_to_new[tid]
             new_tcfg = copy.deepcopy(tcfg)
-            new_tcfg["task_id"] = new_tid
             # Rewrite dependencies
             if "dependencies" in new_tcfg:
                 new_tcfg["dependencies"] = [old_to_new.get(d, d) for d in new_tcfg["dependencies"]]
+            # Rewrite xcom_pull(task_ids='...') to the prefixed ids. Without this,
+            # composing produced YAML referencing task ids that do not exist in the
+            # composed DAG — invalid for 15 of the 29 services.
+            _rewrite_xcom_task_ids(new_tcfg, old_to_new)
             prefixed_tasks[new_tid] = new_tcfg
 
         service_task_ids[prefix] = ordered_ids
@@ -347,7 +414,7 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
             all_params[f"{prefix}_{k}"] = v
 
         # Rewrite param references in task values
-        for new_tid, tcfg in prefixed_tasks.items():
+        for tcfg in prefixed_tasks.values():
             _rewrite_param_refs(tcfg, prefix)
 
     # Build DAG
@@ -359,6 +426,12 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
     for k, v in all_params.items():
         if k not in merged_params:
             merged_params[k] = v
+
+    # CloudFormationCreateStackOperator returns None, so reading its Outputs from XCom
+    # fails at run time. generate_yaml has always stripped this pattern; compose_dag_yaml
+    # did not, so the same defect came back through the other entry point.
+    _replace_cfn_output_xcoms(all_tasks, merged_params)
+
     if merged_params:
         dag[dag_id]["params"] = merged_params
 
@@ -370,7 +443,6 @@ def compose_dag_yaml(dag_id, services_config, description="", schedule="None", p
 
 def _rewrite_param_refs(obj, prefix):
     """Rewrite {{ params.X }} references to {{ params.prefix_X }} in all string values."""
-    import re
     if isinstance(obj, dict):
         for k, v in obj.items():
             if isinstance(v, str) and "{{ params." in v:
@@ -383,6 +455,96 @@ def _rewrite_param_refs(obj, prefix):
                 obj[i] = re.sub(r"\{\{\s*params\.(\w+)\s*\}\}", r"{{ params." + prefix + r"_\1 }}", v)
             else:
                 _rewrite_param_refs(v, prefix)
+
+
+_XCOM_TASK_IDS_RE = re.compile(r"(task_ids\s*=\s*)(['\"])([^'\"]+)\2")
+
+
+def _rewrite_xcom_task_ids(obj, old_to_new):
+    """Rewrite xcom_pull(task_ids='old') to the composed DAG's prefixed task ids."""
+    def _fix(value):
+        def _sub(m):
+            return f"{m.group(1)}{m.group(2)}{old_to_new.get(m.group(3), m.group(3))}{m.group(2)}"
+        return _XCOM_TASK_IDS_RE.sub(_sub, value)
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                obj[k] = _fix(v)
+            else:
+                _rewrite_xcom_task_ids(v, old_to_new)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, str):
+                obj[i] = _fix(v)
+            else:
+                _rewrite_xcom_task_ids(v, old_to_new)
+
+
+# Params that name a resource the DEMO ITSELF creates and then deletes. Every
+# reference to these is made unique per run — see _uniquify_owned_resource_names.
+_RUN_SCOPED_PARAMS = ("stack_name", "bucket_name")
+
+# ts_nodash is unique per logical run (e.g. 20260917T142530) and is on the supported
+# Jinja list. Bucket names must be lowercase, so they get the |lower form.
+_RUN_SUFFIX = "{{ ts_nodash }}"
+_RUN_SUFFIX_LOWER = "{{ ts_nodash | lower }}"
+
+_OWNED_PARAM_RE = re.compile(
+    r"\{\{\s*params\.(" + "|".join(_RUN_SCOPED_PARAMS) + r")\s*\}\}"
+    r"(?P<existing>-\{\{\s*ds_nodash\s*\}\})?"
+)
+
+
+def _uniquify_owned_resource_names(tasks):
+    """Make every demo-created resource name unique to the run that creates it.
+
+    This is what makes the templates' `trigger_rule: all_done` cleanup safe.
+    Previously a template used a FIXED default stack name — the athena demo used
+    `covid-lake-stack`, the name AWS's own COVID-19 data-lake walkthrough uses, and
+    the cloudformation demo used the generic `my-cfn-stack`. In an account that
+    already had that stack, create_stack failed with AlreadyExistsException, the work
+    tasks failed, and then the unconditional delete_stack ran anyway and DELETED THE
+    CUSTOMER'S STACK. constraints.AUTHORING_POLICY says it plainly: do not add cleanup
+    tasks unless the DAG itself created the resource.
+
+    Appending the run timestamp makes a collision impossible, so the DAG can only ever
+    delete a stack it just created. Returns the number of references rewritten.
+    """
+    rewritten = 0
+
+    def _fix(value):
+        nonlocal rewritten
+
+        def _sub(m):
+            nonlocal rewritten
+            rewritten += 1
+            param = m.group(1)
+            # ds_nodash (date only) is not unique across runs on the same day.
+            suffix = _RUN_SUFFIX_LOWER if param == "bucket_name" else _RUN_SUFFIX
+            return "{{ params.%s }}-%s" % (param, suffix)
+
+        return _OWNED_PARAM_RE.sub(_sub, value)
+
+    def _walk(node):
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                if isinstance(v, str):
+                    node[k] = _fix(v)
+                else:
+                    _walk(v)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                if isinstance(v, str):
+                    node[i] = _fix(v)
+                else:
+                    _walk(v)
+
+    entries = tasks.values() if isinstance(tasks, dict) else tasks
+    for tcfg in entries:
+        if isinstance(tcfg, dict):
+            _walk(tcfg)
+    return rewritten
 
 
 def list_unsupported():
@@ -628,18 +790,130 @@ _OPERATOR_IAM_MAP = {
 }
 
 # Operator modules whose tasks hand a role to another AWS service, so the
-# execution role needs iam:PassRole. Adding PassRole unconditionally is a
-# meaningful privilege escalation, so it is only included when needed.
-_PASSROLE_MODULES = {
-    "glue", "glue_crawler", "emr", "sagemaker", "sagemaker_unified_studio",
-    "ecs", "eks", "batch", "cloud_formation", "dms", "kinesis_analytics",
-    "datasync", "rds", "comprehend",
+# execution role needs iam:PassRole, mapped to the service principal that role is
+# passed to. A dict rather than a chain of ternaries: the previous nested-ternary
+# form ended in a bare `else "comprehend.amazonaws.com"`, so adding a module here
+# without editing the chain would have silently granted PassRole to Comprehend.
+_PASSROLE_SERVICE_PRINCIPALS = {
+    "glue": "glue.amazonaws.com",
+    "glue_crawler": "glue.amazonaws.com",
+    "emr": "elasticmapreduce.amazonaws.com",
+    "sagemaker": "sagemaker.amazonaws.com",
+    "sagemaker_unified_studio": "sagemaker.amazonaws.com",
+    "ecs": "ecs-tasks.amazonaws.com",
+    "eks": "eks.amazonaws.com",
+    "batch": "batch.amazonaws.com",
+    "cloud_formation": "cloudformation.amazonaws.com",
+    "dms": "dms.amazonaws.com",
+    "kinesis_analytics": "kinesisanalytics.amazonaws.com",
+    "datasync": "datasync.amazonaws.com",
+    "rds": "rds.amazonaws.com",
+    "comprehend": "comprehend.amazonaws.com",
 }
+_PASSROLE_MODULES = set(_PASSROLE_SERVICE_PRINCIPALS)
+
+# Passing a role to CloudFormation is not "one more permission" — it is a full
+# privilege-escalation primitive. CloudFormation acts with whatever role it is
+# handed, so iam:PassRole to cloudformation.amazonaws.com plus CreateStack lets the
+# holder do anything ANY passable role in the account can do. It is therefore never
+# granted implicitly: the caller must name the exact role ARNs.
+_PASSROLE_ESCALATION_PRINCIPALS = {"cloudformation.amazonaws.com"}
+
+# Actions that destroy or terminate customer resources. Kept in a separate policy
+# statement so a reviewer sees them as a group and can delete the statement outright
+# when the DAG does not create the resources it operates on.
+_DESTRUCTIVE_ACTION_VERBS = ("Delete", "Terminate", "Purge", "Destroy", "Deregister")
+
+# Services whose ARNs carry no region or account (S3) or no account (Bedrock's
+# foundation models). Everything else follows arn:PARTITION:SERVICE:REGION:ACCOUNT:*.
+_ACCOUNTLESS_ARN_SERVICES = {"s3"}
+_REGIONLESS_ARN_SERVICES = {"iam", "s3"}
+
+_ACCOUNT_PLACEHOLDER = "${ACCOUNT_ID}"
+_REGION_PLACEHOLDER = "${REGION}"
+_BUCKET_PLACEHOLDER = "${BUCKET_NAME}"
+
+# IAM role names are limited to 64 characters.
+_MAX_ROLE_NAME_LEN = 64
 
 
+def _partition_for_region(region: str) -> str:
+    """AWS partition for a region. A policy written with arn:aws is inert in
+    GovCloud and China: it matches nothing, so tasks lose permissions silently."""
+    if region.startswith("us-gov-"):
+        return "aws-us-gov"
+    if region.startswith("cn-"):
+        return "aws-cn"
+    if region.startswith("us-iso"):
+        return "aws-iso"
+    return "aws"
 
-def generate_execution_role_policy(yaml_content):
-    """Generate an IAM execution role policy and CLI commands for a given DAG YAML."""
+
+def _role_name_for(dag_id: str) -> str:
+    """A valid IAM role name for a DAG. IAM allows [\\w+=,.@-]{1,64}; a long dag_id
+    would otherwise produce a name IAM rejects only when the CLI command is run."""
+    safe = re.sub(r"[^A-Za-z0-9+=,.@_-]", "-", dag_id or "workflow")
+    name = f"mwaa-serverless-{safe}-role"
+    if len(name) <= _MAX_ROLE_NAME_LEN:
+        return name
+    keep = _MAX_ROLE_NAME_LEN - len("mwaa-serverless--role")
+    return f"mwaa-serverless-{safe[:keep]}-role"
+
+
+def _resources_for_actions(actions, partition, region, account):
+    """Group actions by their IAM service prefix and give each group a scoped
+    resource ARN, instead of one blanket Resource: "*".
+
+    The ARN is derived from the action's own service prefix rather than a
+    hand-maintained per-operator table, so it cannot drift out of sync with
+    _OPERATOR_IAM_MAP. It scopes every grant to one service, in one region, in one
+    account — narrower than "*" by construction, and still a pattern the reader is
+    told to narrow further to individual job/table/queue ARNs.
+    """
+    by_service = {}
+    for action in actions:
+        service = action.split(":", 1)[0]
+        by_service.setdefault(service, []).append(action)
+
+    grouped = []
+    for service, svc_actions in sorted(by_service.items()):
+        if service == "s3":
+            resources = [
+                f"arn:{partition}:s3:::{_BUCKET_PLACEHOLDER}",
+                f"arn:{partition}:s3:::{_BUCKET_PLACEHOLDER}/*",
+            ]
+        elif service == "bedrock":
+            resources = [
+                f"arn:{partition}:bedrock:{region}::foundation-model/*",
+                f"arn:{partition}:bedrock:{region}:{account}:*",
+            ]
+        else:
+            arn_region = "" if service in _REGIONLESS_ARN_SERVICES else region
+            arn_account = "" if service in _ACCOUNTLESS_ARN_SERVICES else account
+            resources = [f"arn:{partition}:{service}:{arn_region}:{arn_account}:*"]
+        grouped.append((service, sorted(svc_actions), resources))
+    return grouped
+
+
+def generate_execution_role_policy(yaml_content, account_id: str = "", region: str = "",
+                                   passable_role_arns=None,
+                                   include_destructive_actions: bool = True):
+    """Generate an IAM execution role policy and CLI commands for a given DAG YAML.
+
+    Args:
+        yaml_content: The DAG YAML to analyse.
+        account_id: Your AWS account id. Supplied means real ARNs; omitted means the
+            policy comes back with ${ACCOUNT_ID} placeholders that must be
+            substituted before it can be applied.
+        region: The region the workflow runs in. Also selects the ARN partition, so
+            GovCloud and China get arn:aws-us-gov / arn:aws-cn rather than a policy
+            that silently matches nothing.
+        passable_role_arns: Exact role ARNs the DAG's tasks hand to other services.
+            Required to grant iam:PassRole to CloudFormation, which is a
+            privilege-escalation path when left unscoped.
+        include_destructive_actions: Keep Delete*/Terminate* actions. Set false for a
+            DAG that only reads and runs jobs.
+    """
     import json as _json
     try:
         data = yaml.safe_load(yaml_content)
@@ -661,51 +935,91 @@ def generate_execution_role_policy(yaml_content):
             unmapped.add(svc)
 
     dag_id = list(data.keys())[0]
-    role_name = f"mwaa-serverless-{dag_id}-role"
+    role_name = _role_name_for(dag_id)
+
+    account = account_id.strip() or _ACCOUNT_PLACEHOLDER
+    arn_region = region.strip() or _REGION_PLACEHOLDER
+    partition = _partition_for_region(region.strip())
+    requires_substitution = sorted(
+        {p for p, used in ((_ACCOUNT_PLACEHOLDER, not account_id.strip()),
+                           (_REGION_PLACEHOLDER, not region.strip()),
+                           (_BUCKET_PLACEHOLDER, "s3" in {a.split(":", 1)[0] for a in all_actions}))
+         if used}
+    )
+
+    destructive = sorted(a for a in all_actions
+                         if a.split(":", 1)[-1].startswith(_DESTRUCTIVE_ACTION_VERBS))
+    non_destructive = sorted(all_actions - set(destructive))
+    if not include_destructive_actions:
+        withheld, granted = destructive, non_destructive
+    else:
+        withheld, granted = [], non_destructive
 
     # CloudWatch Logs is required for every workflow so task logs are captured.
     statements = [{
         "Sid": "WorkflowTaskLogging",
         "Effect": "Allow",
         "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"],
-        "Resource": "arn:aws:logs:*:*:log-group:/aws/mwaa-serverless/*",
+        "Resource": f"arn:{partition}:logs:{arn_region}:{account}:log-group:/aws/mwaa-serverless/*",
     }]
 
-    if all_actions:
+    for service, svc_actions, resources in _resources_for_actions(
+            granted, partition, arn_region, account):
         statements.append({
-            "Sid": "OperatorPermissions",
+            "Sid": f"Operator{service.replace('-', '').title()}",
             "Effect": "Allow",
-            "Action": sorted(all_actions),
-            "Resource": "*",
+            "Action": svc_actions,
+            "Resource": resources[0] if len(resources) == 1 else resources,
         })
 
-    # iam:PassRole only when a task actually hands a role to another service.
+    if include_destructive_actions and destructive:
+        for service, svc_actions, resources in _resources_for_actions(
+                destructive, partition, arn_region, account):
+            statements.append({
+                "Sid": f"Destructive{service.replace('-', '').title()}",
+                "Effect": "Allow",
+                "Action": svc_actions,
+                "Resource": resources[0] if len(resources) == 1 else resources,
+            })
+
+    # iam:PassRole only when a task actually hands a role to another service, and
+    # only to the roles the caller names.
     passrole_services = sorted(operator_services & _PASSROLE_MODULES)
-    if passrole_services:
+    principals = sorted({_PASSROLE_SERVICE_PRINCIPALS[s] for s in passrole_services})
+    named_roles = [r.strip() for r in (passable_role_arns or []) if str(r).strip()]
+    escalation_principals = sorted(set(principals) & _PASSROLE_ESCALATION_PRINCIPALS)
+    passrole_notes = []
+
+    if principals and not named_roles and escalation_principals:
+        # Refuse to emit the escalation grant with no role scope at all.
+        principals = [p for p in principals if p not in _PASSROLE_ESCALATION_PRINCIPALS]
+        passrole_notes.append(
+            f"iam:PassRole to {', '.join(escalation_principals)} was NOT included. "
+            f"CloudFormation acts with whatever role it is given, so an unscoped grant "
+            f"lets this role do anything any passable role in the account can do — "
+            f"including an AdministratorAccess role. Re-run with "
+            f"passable_role_arns=['arn:{partition}:iam::{account}:role/your-cfn-service-role'] "
+            f"to grant it against exactly that role."
+        )
+
+    if principals:
+        passrole_resource = named_roles or [
+            f"arn:{partition}:iam::{account}:role/mwaa-serverless-*"
+        ]
+        if not named_roles:
+            passrole_notes.append(
+                "iam:PassRole is scoped to roles named mwaa-serverless-* because no "
+                "passable_role_arns were supplied. Name the exact role ARNs your tasks pass, "
+                "or rename those roles to match the prefix. Never widen this to \"*\": the "
+                "iam:PassedToService condition limits which SERVICE receives the role, not "
+                "which role can be passed."
+            )
         statements.append({
             "Sid": "PassRoleToAwsServices",
             "Effect": "Allow",
             "Action": ["iam:PassRole"],
-            "Resource": "*",
-            "Condition": {
-                "StringEquals": {
-                    "iam:PassedToService": sorted({
-                        "glue.amazonaws.com" if s in ("glue", "glue_crawler") else
-                        "elasticmapreduce.amazonaws.com" if s == "emr" else
-                        "sagemaker.amazonaws.com" if s.startswith("sagemaker") else
-                        "ecs-tasks.amazonaws.com" if s == "ecs" else
-                        "eks.amazonaws.com" if s == "eks" else
-                        "batch.amazonaws.com" if s == "batch" else
-                        "cloudformation.amazonaws.com" if s == "cloud_formation" else
-                        "dms.amazonaws.com" if s == "dms" else
-                        "kinesisanalytics.amazonaws.com" if s == "kinesis_analytics" else
-                        "datasync.amazonaws.com" if s == "datasync" else
-                        "rds.amazonaws.com" if s == "rds" else
-                        "comprehend.amazonaws.com"
-                        for s in passrole_services
-                    })
-                }
-            },
+            "Resource": passrole_resource[0] if len(passrole_resource) == 1 else passrole_resource,
+            "Condition": {"StringEquals": {"iam:PassedToService": principals}},
         })
 
     policy = {"Version": "2012-10-17", "Statement": statements}
@@ -715,43 +1029,99 @@ def generate_execution_role_policy(yaml_content):
             "Effect": "Allow",
             "Principal": {"Service": "airflow-serverless.amazonaws.com"},
             "Action": "sts:AssumeRole",
+            # Guards against a confused-deputy: without these the role can be assumed
+            # on behalf of any account's workflow that reaches the service.
+            "Condition": {
+                "StringEquals": {"aws:SourceAccount": account},
+                "ArnLike": {
+                    "aws:SourceArn": f"arn:{partition}:airflow-serverless:{arn_region}:{account}:workflow/*"
+                },
+            },
         }],
     }
 
     needs_code = _dag_needs_code_bundle(data)
     scope_down = [
-        "Replace Resource: \"*\" on OperatorPermissions with the specific bucket, job, table and "
-        "queue ARNs the DAG touches.",
+        f"Narrow each Operator* statement from arn:{partition}:SERVICE:{arn_region}:{account}:* "
+        f"to the individual job, table, queue and state-machine ARNs the DAG names.",
     ]
-    if "s3" in operator_services or "athena" in operator_services:
+    if "s3" in {a.split(":", 1)[0] for a in all_actions}:
         scope_down.append(
-            "S3 needs two entries per bucket: the bucket ARN for s3:ListBucket and "
-            "arn:aws:s3:::bucket/* for object actions."
+            f"Replace {_BUCKET_PLACEHOLDER} with your bucket. S3 needs both entries: the bucket "
+            f"ARN for s3:ListBucket and the /* form for object actions."
         )
-    if passrole_services:
+    if destructive and include_destructive_actions:
         scope_down.append(
-            "Narrow iam:PassRole to the exact service role ARNs the tasks pass, not \"*\"."
+            "Delete the Destructive* statement(s) unless this DAG created the resources it "
+            "deletes. They currently allow "
+            + ", ".join(destructive[:6]) + ("..." if len(destructive) > 6 else "")
+            + " within the scoped ARNs."
         )
+    if principals:
+        scope_down.append(
+            "Replace the iam:PassRole Resource with the exact role ARNs your tasks pass."
+        )
+
+    if requires_substitution:
+        cli_commands = {
+            "1_write_policy": (
+                f"cat > {role_name}-policy.json <<'JSON'\n{_json.dumps(policy, indent=2)}\nJSON"
+            ),
+            "2_substitute_placeholders": (
+                "# Edit the file and replace: " + ", ".join(requires_substitution)
+                + f"\n#   e.g. sed -i.bak 's/\\{_ACCOUNT_PLACEHOLDER}/123456789012/g' "
+                  f"{role_name}-policy.json"
+            ),
+            "3_create_role": (
+                f"aws iam create-role --role-name {role_name} "
+                f"--assume-role-policy-document '{_json.dumps(trust_policy)}'"
+            ),
+            "4_put_policy": (
+                f"aws iam put-role-policy --role-name {role_name} "
+                f"--policy-name {dag_id}-policy --policy-document file://{role_name}-policy.json"
+            ),
+            "5_get_role_arn": (
+                f"aws iam get-role --role-name {role_name} --query 'Role.Arn' --output text"
+            ),
+        }
+    else:
+        cli_commands = {
+            "create_role": (
+                f"aws iam create-role --role-name {role_name} "
+                f"--assume-role-policy-document '{_json.dumps(trust_policy)}'"
+            ),
+            "put_policy": (
+                f"aws iam put-role-policy --role-name {role_name} "
+                f"--policy-name {dag_id}-policy --policy-document '{_json.dumps(policy)}'"
+            ),
+            "get_role_arn": (
+                f"aws iam get-role --role-name {role_name} --query 'Role.Arn' --output text"
+            ),
+        }
 
     return {
         "role_name": role_name,
         "trust_policy": trust_policy,
         "permissions_policy": policy,
+        "partition": partition,
+        "requires_substitution": requires_substitution or None,
         "detected_services": sorted(operator_services),
         "unmapped_services": sorted(unmapped) or None,
+        "destructive_actions_granted": destructive if include_destructive_actions else None,
+        "destructive_actions_withheld": withheld or None,
         "passrole_required_for": passrole_services or None,
+        "passrole_notes": passrole_notes or None,
         "code_bundle_note": (
             "This DAG has Python/Bash tasks. Their code runs under this same role, so it also "
             "needs whatever AWS permissions the code itself calls."
         ) if needs_code else None,
-        "cli_commands": {
-            "create_role": f"aws iam create-role --role-name {role_name} --assume-role-policy-document '{_json.dumps(trust_policy)}'",
-            "put_policy": f"aws iam put-role-policy --role-name {role_name} --policy-name {dag_id}-policy --policy-document '{_json.dumps(policy)}'",
-            "get_role_arn": f"aws iam get-role --role-name {role_name} --query 'Role.Arn' --output text",
-        },
+        "cli_commands": cli_commands,
         "note": (
-            "Actions are scoped to the API calls these operators make, but resources are still "
-            "\"*\". Tighten before production."
+            "Every statement is scoped to one service, region and account — no Resource: \"*\". "
+            + (f"The policy still contains {', '.join(requires_substitution)}; it cannot be "
+               f"applied until those are replaced (pass account_id and region to get real ARNs). "
+               if requires_substitution else "")
+            + "Narrow to individual resource ARNs before production."
         ),
         "how_to_scope_down": scope_down,
     }
@@ -876,6 +1246,16 @@ def _get_service_templates():
                             "Resources:\n"
                             "  ScriptBucket:\n"
                             "    Type: AWS::S3::Bucket\n"
+                            "    Properties:\n"
+                            "      BucketEncryption:\n"
+                            "        ServerSideEncryptionConfiguration:\n"
+                            "          - ServerSideEncryptionByDefault:\n"
+                            "              SSEAlgorithm: AES256\n"
+                            "      PublicAccessBlockConfiguration:\n"
+                            "        BlockPublicAcls: true\n"
+                            "        BlockPublicPolicy: true\n"
+                            "        IgnorePublicAcls: true\n"
+                            "        RestrictPublicBuckets: true\n"
                             "  GlueRole:\n"
                             "    Type: AWS::IAM::Role\n"
                             "    Properties:\n"
@@ -894,8 +1274,14 @@ def _get_service_templates():
                             "            Version: '2012-10-17'\n"
                             "            Statement:\n"
                             "              - Effect: Allow\n"
-                            "                Action: s3:*\n"
-                            "                Resource: '*'\n"
+                            "                Action:\n"
+                            "                  - s3:GetObject\n"
+                            "                  - s3:PutObject\n"
+                            "                  - s3:DeleteObject\n"
+                            "                Resource: !Sub '${ScriptBucket.Arn}/*'\n"
+                            "              - Effect: Allow\n"
+                            "                Action: s3:ListBucket\n"
+                            "                Resource: !GetAtt ScriptBucket.Arn\n"
                             "Outputs:\n"
                             "  BucketName:\n"
                             "    Value: !Ref ScriptBucket\n"
@@ -991,24 +1377,34 @@ def _get_service_templates():
             },
         },
         "athena": {
-            "default_params": {"output_location": "s3://amzn-s3-demo-bucket/athena-results/"},
+            "default_params": {
+                # The COVID-19 open data lake this demo queries lives in us-east-2, and
+                # the CloudFormation template that registers its Glue tables is served
+                # from a us-east-2 bucket. Running the demo elsewhere means Athena reads
+                # across Regions: it works, but it is slower and incurs transfer cost.
+                "stack_name": "mwaa-demo-covid-lake",
+                # REPLACE_ME_ so the value is reported in params_you_must_set instead of
+                # silently shipping the AWS docs placeholder bucket, which fails with
+                # NoSuchBucket on the first query.
+                "output_location": "s3://REPLACE_ME_your-athena-results-bucket/athena-results/",
+            },
             "extra_fields": {"dag_id": "athena_dag"},
             "tasks": {
                 "create_stack": {
                     "operator": "CloudFormationCreateStackOperator",
                     "cloudformation_parameters": {
-                        "StackName": "covid-lake-stack",
+                        "StackName": "{{ params.stack_name }}",
                         "TemplateURL": "https://covid19-lake.s3.us-east-2.amazonaws.com/cfn/CovidLakeStack.template.json",
                         "TimeoutInMinutes": 5,
                         "OnFailure": "DELETE",
                     },
-                    "stack_name": "covid-lake-stack",
+                    "stack_name": "{{ params.stack_name }}",
                     "task_id": "create_stack",
                     "dependencies": [],
                 },
                 "wait_for_stack_create": {
                     "operator": "CloudFormationCreateStackSensor",
-                    "stack_name": "covid-lake-stack",
+                    "stack_name": "{{ params.stack_name }}",
                     "task_id": "wait_for_stack_create",
                     "dependencies": ["create_stack"],
                 },
@@ -1062,14 +1458,14 @@ def _get_service_templates():
                 },
                 "delete_stack": {
                     "operator": "CloudFormationDeleteStackOperator",
-                    "stack_name": "covid-lake-stack",
+                    "stack_name": "{{ params.stack_name }}",
                     "task_id": "delete_stack",
                     "trigger_rule": "all_done",
                     "dependencies": ["query_1", "query_3", "query_2"],
                 },
                 "wait_for_stack_delete": {
                     "operator": "CloudFormationDeleteStackSensor",
-                    "stack_name": "covid-lake-stack",
+                    "stack_name": "{{ params.stack_name }}",
                     "task_id": "wait_for_stack_delete",
                     "trigger_rule": "all_success",
                     "dependencies": ["delete_stack"],
@@ -1198,6 +1594,16 @@ def _get_service_templates():
                                 "        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess\n"
                                 "  ScriptBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "Outputs:\n"
                                 "  RoleArn:\n"
                                 "    Value: !GetAtt EmrServerlessRole.Arn\n"
@@ -1219,7 +1625,9 @@ def _get_service_templates():
                     "parameters": {
                         "release_label": "emr-7.0.0",
                         "job_type": "SPARK",
-                        "client_request_token": "{{ ds_nodash }}",
+                        # An EMR idempotency token, not a secret. Rendered per run so a
+                        # retry does not submit the job twice.
+                        "client_request_token": "{{ ds_nodash }}",  # nosec B105
                     },
                     "upstream_tasks": ["wait_for_emr_stack"],
                 },
@@ -1292,7 +1700,7 @@ def _get_service_templates():
                                 "        Subnets:\n"
                                 "          - !Ref PublicSubnet\n"
                                 "        SecurityGroupIds:\n"
-                                "          - !GetAtt VPC.DefaultSecurityGroup\n"
+                                "          - !Ref TaskSecurityGroup\n"
                                 "      ServiceRole: !GetAtt BatchServiceRole.Arn\n"
                                 "  VPC:\n"
                                 "    Type: AWS::EC2::VPC\n"
@@ -1306,6 +1714,15 @@ def _get_service_templates():
                                 "      VpcId: !Ref VPC\n"
                                 "      CidrBlock: 10.0.1.0/24\n"
                                 "      MapPublicIpOnLaunch: true\n"
+                                "  TaskSecurityGroup:\n"
+                                "    Type: AWS::EC2::SecurityGroup\n"
+                                "    Properties:\n"
+                                "      GroupDescription: Egress-only group for demo Fargate tasks\n"
+                                "      VpcId: !Ref VPC\n"
+                                "      SecurityGroupEgress:\n"
+                                "        - IpProtocol: -1\n"
+                                "          CidrIp: 0.0.0.0/0\n"
+                                "          Description: Outbound only; no inbound rules are defined\n"
                                 "  IGW:\n"
                                 "    Type: AWS::EC2::InternetGateway\n"
                                 "  AttachIGW:\n"
@@ -1313,6 +1730,27 @@ def _get_service_templates():
                                 "    Properties:\n"
                                 "      VpcId: !Ref VPC\n"
                                 "      InternetGatewayId: !Ref IGW\n"
+                                # A public subnet with an attached IGW still has no route
+                                # OUT without these three resources. Without them the
+                                # Fargate task launches with a public IP, fails to pull its
+                                # image from public.ecr.aws, and the demo hangs until the
+                                # ECS timeout rather than reporting anything useful.
+                                "  PublicRouteTable:\n"
+                                "    Type: AWS::EC2::RouteTable\n"
+                                "    Properties:\n"
+                                "      VpcId: !Ref VPC\n"
+                                "  PublicRoute:\n"
+                                "    Type: AWS::EC2::Route\n"
+                                "    DependsOn: AttachIGW\n"
+                                "    Properties:\n"
+                                "      RouteTableId: !Ref PublicRouteTable\n"
+                                "      DestinationCidrBlock: 0.0.0.0/0\n"
+                                "      GatewayId: !Ref IGW\n"
+                                "  PublicSubnetRouteAssoc:\n"
+                                "    Type: AWS::EC2::SubnetRouteTableAssociation\n"
+                                "    Properties:\n"
+                                "      SubnetId: !Ref PublicSubnet\n"
+                                "      RouteTableId: !Ref PublicRouteTable\n"
                                 "  JobQueue:\n"
                                 "    Type: AWS::Batch::JobQueue\n"
                                 "    Properties:\n"
@@ -1485,13 +1923,25 @@ def _get_service_templates():
                             "TemplateBody": (
                                 "AWSTemplateFormatVersion: '2010-09-09'\n"
                                 "Resources:\n"
+                                "  AdminSecret:\n"
+                                "    Type: AWS::SecretsManager::Secret\n"
+                                "    Properties:\n"
+                                "      Description: Generated admin password for the demo namespace\n"
+                                "      GenerateSecretString:\n"
+                                "        SecretStringTemplate: '{\"username\": \"admin\"}'\n"
+                                "        GenerateStringKey: password\n"
+                                "        PasswordLength: 32\n"
+                                "        ExcludeCharacters: '\"@/\\\\'\n"
                                 "  RedshiftNamespace:\n"
                                 "    Type: AWS::RedshiftServerless::Namespace\n"
                                 "    Properties:\n"
                                 "      NamespaceName: mwaa-test-ns\n"
                                 "      DbName: dev\n"
                                 "      AdminUsername: admin\n"
-                                "      AdminUserPassword: REPLACE_ME_SecurePassword1!\n"
+                                # Generated and stored in Secrets Manager rather than written
+                                # in the template. A literal here would otherwise end up in the
+                                # DAG YAML and in the immutable workflow snapshot in S3.
+                                "      AdminUserPassword: !Sub '{{resolve:secretsmanager:${AdminSecret}::password}}'\n"
                                 "  RedshiftWorkgroup:\n"
                                 "    Type: AWS::RedshiftServerless::Workgroup\n"
                                 "    Properties:\n"
@@ -1630,6 +2080,27 @@ def _get_service_templates():
                                 "    Properties:\n"
                                 "      VpcId: !Ref VPC\n"
                                 "      InternetGatewayId: !Ref IGW\n"
+                                # A public subnet with an attached IGW still has no route
+                                # OUT without these three resources. Without them the
+                                # Fargate task launches with a public IP, fails to pull its
+                                # image from public.ecr.aws, and the demo hangs until the
+                                # ECS timeout rather than reporting anything useful.
+                                "  PublicRouteTable:\n"
+                                "    Type: AWS::EC2::RouteTable\n"
+                                "    Properties:\n"
+                                "      VpcId: !Ref VPC\n"
+                                "  PublicRoute:\n"
+                                "    Type: AWS::EC2::Route\n"
+                                "    DependsOn: AttachIGW\n"
+                                "    Properties:\n"
+                                "      RouteTableId: !Ref PublicRouteTable\n"
+                                "      DestinationCidrBlock: 0.0.0.0/0\n"
+                                "      GatewayId: !Ref IGW\n"
+                                "  PublicSubnetRouteAssoc:\n"
+                                "    Type: AWS::EC2::SubnetRouteTableAssociation\n"
+                                "    Properties:\n"
+                                "      SubnetId: !Ref PublicSubnet\n"
+                                "      RouteTableId: !Ref PublicRouteTable\n"
                                 "  EcsCluster:\n"
                                 "    Type: AWS::ECS::Cluster\n"
                                 "    Properties:\n"
@@ -1756,6 +2227,17 @@ def _get_service_templates():
                                 "            Action: sts:AssumeRole\n"
                                 "      ManagedPolicyArns:\n"
                                 "        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy\n"
+                                # A purpose-built group rather than the VPC default, which
+                                # allows all traffic between anything attached to it.
+                                "  ClusterSecurityGroup:\n"
+                                "    Type: AWS::EC2::SecurityGroup\n"
+                                "    Properties:\n"
+                                "      GroupDescription: Egress-only group for the demo EKS control plane\n"
+                                "      VpcId: !Ref VPC\n"
+                                "      SecurityGroupEgress:\n"
+                                "        - IpProtocol: -1\n"
+                                "          CidrIp: 0.0.0.0/0\n"
+                                "          Description: Outbound only; no inbound rules are defined\n"
                                 "Outputs:\n"
                                 "  RoleArn:\n"
                                 "    Value: !GetAtt EksRole.Arn\n"
@@ -1764,7 +2246,7 @@ def _get_service_templates():
                                 "  SubnetBId:\n"
                                 "    Value: !Ref SubnetB\n"
                                 "  SecurityGroupId:\n"
-                                "    Value: !GetAtt VPC.DefaultSecurityGroup\n"
+                                "    Value: !Ref ClusterSecurityGroup\n"
                             ),
                         },
                     },
@@ -1837,6 +2319,16 @@ def _get_service_templates():
                                 "Resources:\n"
                                 "  LogBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "  EmrServiceRole:\n"
                                 "    Type: AWS::IAM::Role\n"
                                 "    Properties:\n"
@@ -1950,7 +2442,18 @@ def _get_service_templates():
             ],
         },
         "sagemaker": {
-            "default_params": {"instance_type": "ml.m5.large", "stack_name": "mwaa-test-sagemaker-stack", "image_uri": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"},
+            "default_params": {
+                "instance_type": "ml.m5.large",
+                "stack_name": "mwaa-test-sagemaker-stack",
+                # SageMaker's built-in image accounts differ PER REGION, and a processing
+                # job cannot pull from another Region's ECR. Hardcoding the us-east-1
+                # account (683313688378) meant this demo only ever worked in us-east-1 and
+                # failed elsewhere with an image-pull error. Look yours up with:
+                #   python -c "import sagemaker;
+                #     print(sagemaker.image_uris.retrieve('sklearn','<your-region>',version='1.2-1'))"
+                # or see docs.aws.amazon.com/sagemaker/latest/dg-ecr-paths/ecr-<region>.html
+                "image_uri": "REPLACE_ME_sagemaker_sklearn_image_uri_for_your_region",
+            },
             "tasks": [
                 {
                     "task_id": "create_sagemaker_stack",
@@ -2030,6 +2533,15 @@ def _get_service_templates():
                             "TemplateBody": (
                                 "AWSTemplateFormatVersion: '2010-09-09'\n"
                                 "Resources:\n"
+                                "  MasterSecret:\n"
+                                "    Type: AWS::SecretsManager::Secret\n"
+                                "    Properties:\n"
+                                "      Description: Generated master password for the demo database\n"
+                                "      GenerateSecretString:\n"
+                                "        SecretStringTemplate: '{\"username\": \"admin\"}'\n"
+                                "        GenerateStringKey: password\n"
+                                "        PasswordLength: 32\n"
+                                "        ExcludeCharacters: '\"@/\\\\'\n"
                                 "  TestDB:\n"
                                 "    Type: AWS::RDS::DBInstance\n"
                                 "    Properties:\n"
@@ -2037,13 +2549,21 @@ def _get_service_templates():
                                 "      DBInstanceClass: db.t3.micro\n"
                                 "      Engine: mysql\n"
                                 "      MasterUsername: admin\n"
-                                "      MasterUserPassword: REPLACE_ME_SecurePassword1!\n"
+                                "      MasterUserPassword: !Sub '{{resolve:secretsmanager:${MasterSecret}::password}}'\n"
                                 "      AllocatedStorage: '20'\n"
+                                # Encryption at rest is not optional in a sample, even for a
+                                # throwaway demo instance.
+                                "      StorageEncrypted: true\n"
+                                "      PubliclyAccessible: false\n"
+                                # 0 / false are deliberate for a demo that tears itself down.
+                                # Both MUST be raised for anything real.
                                 "      BackupRetentionPeriod: 0\n"
                                 "      DeletionProtection: false\n"
                                 "Outputs:\n"
                                 "  DBInstanceId:\n"
                                 "    Value: !Ref TestDB\n"
+                                "  SecretArn:\n"
+                                "    Value: !Ref MasterSecret\n"
                             ),
                         },
                     },
@@ -2313,6 +2833,16 @@ def _get_service_templates():
                                 "Resources:\n"
                                 "  DataBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "  ComprehendRole:\n"
                                 "    Type: AWS::IAM::Role\n"
                                 "    Properties:\n"
@@ -2329,7 +2859,10 @@ def _get_service_templates():
                                 "            Version: '2012-10-17'\n"
                                 "            Statement:\n"
                                 "              - Effect: Allow\n"
-                                "                Action: s3:*\n"
+                                "                Action:\n"
+                                "                  - s3:GetObject\n"
+                                "                  - s3:PutObject\n"
+                                "                  - s3:ListBucket\n"
                                 "                Resource:\n"
                                 "                  - !GetAtt DataBucket.Arn\n"
                                 "                  - !Sub '${DataBucket.Arn}/*'\n"
@@ -2415,23 +2948,24 @@ def _get_service_templates():
                             "TemplateBody": (
                                 "AWSTemplateFormatVersion: '2010-09-09'\n"
                                 "Description: DMS replication instance for testing\n"
+                                "# NOTE: this stack deliberately does NOT create the\n"
+                                "# 'dms-vpc-role' service role. That name is fixed and\n"
+                                "# account-global: every DMS replication instance in the\n"
+                                "# account depends on it. A demo that created it would fail\n"
+                                "# with EntityAlreadyExists in an account that has it, and\n"
+                                "# in an account that does not, the teardown would DELETE it\n"
+                                "# and break every later DMS workload. Create it once,\n"
+                                "# outside this demo:\n"
+                                "#   aws iam create-role --role-name dms-vpc-role \\\n"
+                                "#     --assume-role-policy-document \\\n"
+                                "#     '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\n"
+                                "#       \"Principal\":{\"Service\":\"dms.amazonaws.com\"},\n"
+                                "#       \"Action\":\"sts:AssumeRole\"}]}'\n"
+                                "#   aws iam attach-role-policy --role-name dms-vpc-role \\\n"
+                                "#     --policy-arn arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole\n"
                                 "Resources:\n"
-                                "  DmsRole:\n"
-                                "    Type: AWS::IAM::Role\n"
-                                "    Properties:\n"
-                                "      RoleName: dms-vpc-role\n"
-                                "      AssumeRolePolicyDocument:\n"
-                                "        Version: '2012-10-17'\n"
-                                "        Statement:\n"
-                                "          - Effect: Allow\n"
-                                "            Principal:\n"
-                                "              Service: dms.amazonaws.com\n"
-                                "            Action: sts:AssumeRole\n"
-                                "      ManagedPolicyArns:\n"
-                                "        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole\n"
                                 "  ReplicationInstance:\n"
                                 "    Type: AWS::DMS::ReplicationInstance\n"
-                                "    DependsOn: DmsRole\n"
                                 "    Properties:\n"
                                 "      ReplicationInstanceClass: dms.t3.micro\n"
                                 "      ReplicationInstanceIdentifier: mwaa-test-dms-ri\n"
@@ -2697,8 +3231,28 @@ def _get_service_templates():
                                 "Resources:\n"
                                 "  SourceBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "  DestBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "  DataSyncRole:\n"
                                 "    Type: AWS::IAM::Role\n"
                                 "    Properties:\n"
@@ -2715,8 +3269,23 @@ def _get_service_templates():
                                 "            Version: '2012-10-17'\n"
                                 "            Statement:\n"
                                 "              - Effect: Allow\n"
-                                "                Action: s3:*\n"
-                                "                Resource: '*'\n"
+                                "                Action:\n"
+                                "                  - s3:GetObject\n"
+                                "                  - s3:PutObject\n"
+                                "                  - s3:DeleteObject\n"
+                                "                  - s3:GetObjectTagging\n"
+                                "                  - s3:PutObjectTagging\n"
+                                "                Resource:\n"
+                                "                  - !Sub '${SourceBucket.Arn}/*'\n"
+                                "                  - !Sub '${DestBucket.Arn}/*'\n"
+                                "              - Effect: Allow\n"
+                                "                Action:\n"
+                                "                  - s3:ListBucket\n"
+                                "                  - s3:GetBucketLocation\n"
+                                "                  - s3:ListBucketMultipartUploads\n"
+                                "                Resource:\n"
+                                "                  - !GetAtt SourceBucket.Arn\n"
+                                "                  - !GetAtt DestBucket.Arn\n"
                                 "  SourceLocation:\n"
                                 "    Type: AWS::DataSync::LocationS3\n"
                                 "    Properties:\n"
@@ -2786,8 +3355,28 @@ def _get_service_templates():
                                 "Resources:\n"
                                 "  SourceBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "  DestBucket:\n"
                                 "    Type: AWS::S3::Bucket\n"
+                                "    Properties:\n"
+                                "      BucketEncryption:\n"
+                                "        ServerSideEncryptionConfiguration:\n"
+                                "          - ServerSideEncryptionByDefault:\n"
+                                "              SSEAlgorithm: AES256\n"
+                                "      PublicAccessBlockConfiguration:\n"
+                                "        BlockPublicAcls: true\n"
+                                "        BlockPublicPolicy: true\n"
+                                "        IgnorePublicAcls: true\n"
+                                "        RestrictPublicBuckets: true\n"
                                 "  TestFlow:\n"
                                 "    Type: AWS::AppFlow::Flow\n"
                                 "    Properties:\n"
@@ -3016,7 +3605,7 @@ def _get_service_templates():
                                 "    Properties:\n"
                                 "      Name: mwaa-test-net-policy\n"
                                 "      Type: network\n"
-                                "      Policy: '[{\"Rules\":[{\"ResourceType\":\"collection\",\"Resource\":[\"collection/mwaa-test-collection\"]}],\"AllowFromPublic\":true}]'\n"
+                                "      Policy: '[{\"Rules\":[{\"ResourceType\":\"collection\",\"Resource\":[\"collection/mwaa-test-collection\"]}],\"AllowFromPublic\":false}]'\n"
                                 "  Collection:\n"
                                 "    Type: AWS::OpenSearchServerless::Collection\n"
                                 "    DependsOn:\n"

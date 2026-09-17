@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """
 MWAA Serverless supported operators and YAML schema.
 
@@ -13,7 +16,11 @@ friendly name to the FQN that must be emitted.
 
 SUPPORTED_OPERATORS = {
     # ── Core / standard provider ──
-    "EmptyOperator": "airflow.operators.empty.EmptyOperator",
+    # All three use the airflow.providers.standard.* path. Airflow 3 moved these out of
+    # airflow.operators.* and the old paths are deprecated shims; the service accepts
+    # both, so a sample should emit the forward-compatible one. EmptyOperator used to be
+    # the odd one out here, mapping to the legacy path while its two siblings did not.
+    "EmptyOperator": "airflow.providers.standard.operators.empty.EmptyOperator",
     "PythonOperator": "airflow.providers.standard.operators.python.PythonOperator",
     "BashOperator": "airflow.providers.standard.operators.bash.BashOperator",
     # ── S3 ──
@@ -269,10 +276,25 @@ SUPPORTED_OPERATORS = {
 # Airflow 3 moved core operators into the "standard" provider but keeps the
 # legacy import paths working. Both forms are accepted by MWAA Serverless.
 ALT_OPERATOR_FQNS = {
-    "airflow.providers.standard.operators.empty.EmptyOperator": "EmptyOperator",
+    "airflow.operators.empty.EmptyOperator": "EmptyOperator",
     "airflow.operators.python.PythonOperator": "PythonOperator",
     "airflow.operators.bash.BashOperator": "BashOperator",
 }
+
+# Self-check: every standard-provider operator resolves to the standard path, and its
+# legacy spelling is still recognised on input. Keeps the two tables from drifting.
+for _short in ("EmptyOperator", "PythonOperator", "BashOperator"):
+    if not SUPPORTED_OPERATORS[_short].startswith("airflow.providers.standard.operators."):
+        raise RuntimeError(
+            f"{_short} should be emitted with its standard-provider path, got "
+            f"{SUPPORTED_OPERATORS[_short]}"
+        )
+    if _short not in ALT_OPERATOR_FQNS.values():
+        raise RuntimeError(
+            f"{_short}'s legacy airflow.operators.* path must stay in ALT_OPERATOR_FQNS "
+            f"so an existing definition using it still validates"
+        )
+del _short
 
 # ── Abstract base classes: in the allowlist but NOT usable as a task operator ──
 ABSTRACT_OPERATORS = {
@@ -280,8 +302,18 @@ ABSTRACT_OPERATORS = {
     "SageMakerBaseOperator", "SageMakerBaseSensor", "BedrockBaseSensor",
     "EmrBaseSensor", "AppflowBaseOperator", "ComprehendBaseOperator",
     "ComprehendBaseSensor", "RdsBaseOperator", "RdsBaseSensor",
-    "DmsTaskBaseSensor", "KinesisAnalyticsV2BaseSensor", "BatchOperatorBase",
+    "DmsTaskBaseSensor", "KinesisAnalyticsV2BaseSensor",
 }
+
+# Self-check: an abstract name that is not in the allowlist can never be matched, so it
+# is dead configuration. "BatchOperatorBase" sat here unnoticed for exactly that reason.
+# A raise rather than an assert, so the check survives `python -O`.
+_UNMATCHABLE_ABSTRACT = ABSTRACT_OPERATORS - set(SUPPORTED_OPERATORS)
+if _UNMATCHABLE_ABSTRACT:
+    raise RuntimeError(
+        f"ABSTRACT_OPERATORS contains names that are not in SUPPORTED_OPERATORS and can "
+        f"therefore never be flagged: {sorted(_UNMATCHABLE_ABSTRACT)}"
+    )
 
 # ── Operators that require code to be uploaded via the CreateWorkflow `Code` parameter ──
 CODE_OPERATORS = {"PythonOperator", "BashOperator"}
@@ -310,10 +342,17 @@ SENSOR_MODES = ("poke", "reschedule")
 # Set it to False if a region regresses, and the guidance follows automatically.
 RESCHEDULE_MODE_SUPPORTED = True
 
+# Shown ONLY when RESCHEDULE_MODE_SUPPORTED is False. It must not assert anything about
+# the service that contradicts constraints.AUTHORING_POLICY["cost_efficiency"], which
+# records reschedule mode as verified working: a reschedule-mode sensor pokes repeatedly
+# within one attempt, reports UP_FOR_RESCHEDULE between checks, and honours its timeout.
+# The previous wording claimed the opposite, so flipping the flag would have started
+# telling users something untrue.
 RESCHEDULE_MODE_UNSUPPORTED = (
-    "mode: reschedule is accepted at create time but is not currently supported end to "
-    "end on MWAA Serverless — the wait does not resume, so the task does not complete. "
-    "Use the default poke mode and bound it with a timeout."
+    "mode: reschedule is disabled in this build (RESCHEDULE_MODE_SUPPORTED is False), "
+    "which is the switch to use if a Region regresses. Use the default poke mode and "
+    "bound it with a timeout — note that poke holds a worker for the whole wait, and "
+    "MWAA Serverless bills for that time."
 )
 
 # One reschedule cycle costs a task start and, measured end to end, roughly 45s of
@@ -536,7 +575,6 @@ OPERATOR_XCOM_RETURNS = {
 # Reverse lookup: FQN -> short name
 FQN_TO_SHORT = {v: k for k, v in SUPPORTED_OPERATORS.items()}
 FQN_TO_SHORT.update(ALT_OPERATOR_FQNS)
-_FQN_TO_SHORT = FQN_TO_SHORT  # backwards-compatible alias
 
 # Set of all operator values the SERVICE accepts (FQNs only).
 ALLOWED_OPERATOR_FQNS = set(SUPPORTED_OPERATORS.values()) | set(ALT_OPERATOR_FQNS.keys())

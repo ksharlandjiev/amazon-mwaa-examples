@@ -1,11 +1,19 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """
 Correct-by-construction DAG assembly and pipeline planning.
 
 `build_dag_yaml` takes a structured task list and emits YAML in the exact shape
 MWAA Serverless accepts. Because the caller never writes YAML by hand, the six
-schema mistakes that dominate real failures (list tasks, short operator names,
-a `parameters:` wrapper, `upstream_tasks`, string durations, bare-int
-`execution_timeout`) cannot occur.
+schema mistakes that dominate real failures cannot reach the output: list-shaped
+tasks, short operator names, a `parameters:` wrapper, `upstream_tasks` (and the
+other dependency spellings, which are normalised to `dependencies`), duration
+strings, and a bare-int `execution_timeout`.
+
+Nothing is changed silently. Every value the builder coerces, caps or renames on
+the caller's behalf is listed in `values_adjusted`, and anything it cannot make
+sense of goes in `build_problems` rather than being replaced with a default.
 
 `plan_pipeline` goes one step earlier: given the operations a user asked for, it
 returns the operator to use, the arguments that must be supplied, the questions
@@ -29,10 +37,27 @@ from schema import (
     is_sensor,
     resolve_operator_fqn,
 )
-from validator import validate
+# Duration parsing and nested-string traversal are shared with the validator rather
+# than reimplemented here. The previous local handling ("any string retry_delay
+# becomes 300") silently discarded the value the caller asked for.
+from validator import _duration_to_seconds, _iter_strings, validate
 
-_AWS_OP = "airflow.providers.amazon.aws.operators."
-_AWS_SENSOR = "airflow.providers.amazon.aws.sensors."
+# Dependency spellings that must never reach the operator constructor. These are
+# normalised to `dependencies`; letting one through is what broke this module's own
+# correct-by-construction guarantee, since `upstream_tasks` was not in _RESERVED_SPEC_KEYS
+# and the spec-passthrough loop copied it verbatim into the emitted task.
+_DEP_ALIASES = ("upstream_tasks", "depends_on", "upstream", "depends", "needs")
+_REVERSE_DEP_ALIASES = ("downstream_tasks", "downstream")
+
+# Spec keys this builder consumes itself instead of forwarding to the operator.
+_RESERVED_SPEC_KEYS = {
+    "task_id", "operator", "params", "parameters", "arguments", "dependencies",
+    "retries", "retry_delay_seconds", "retry_delay",
+    "execution_timeout_minutes", "execution_timeout", "trigger_rule",
+    "sensor_timeout_seconds",
+    *_DEP_ALIASES,
+    *_REVERSE_DEP_ALIASES,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -328,19 +353,25 @@ _SENSOR_COST_NOTE = (
     "ignores it (CreateWorkflow returns 'ignored attributes: deferrable')."
 )
 
-for _step in STEP_CATALOG.values():
-    if is_sensor(_step.get("operator")):
-        rec = dict(_SENSOR_COST_RECOMMENDED)
-        rec.update(_step.get("recommended") or {})
-        _step["recommended"] = rec
-        _step["cost"] = _SENSOR_COST_NOTE
-    elif _step.get("operator") in LONG_WAIT_OPERATOR_PAIRS:
-        _step["cost"] = (
-            f"COST: wait_for_completion: true holds a worker slot for the whole job. For a job "
-            f"that runs more than a few minutes, prefer wait_for_completion: false plus a "
-            f"{LONG_WAIT_OPERATOR_PAIRS[_step['operator']]} with mode: reschedule, which releases "
-            f"the worker between checks. For a short job, blocking is simpler."
-        )
+def _annotate_catalog_with_cost_guidance(catalog):
+    """Attach the cost note each step needs. Called once at import."""
+    for step in catalog.values():
+        operator = step.get("operator")
+        if is_sensor(operator):
+            rec = dict(_SENSOR_COST_RECOMMENDED)
+            rec.update(step.get("recommended") or {})
+            step["recommended"] = rec
+            step["cost"] = _SENSOR_COST_NOTE
+        elif operator in LONG_WAIT_OPERATOR_PAIRS:
+            step["cost"] = (
+                f"COST: wait_for_completion: true holds a worker slot for the whole job. For a job "
+                f"that runs more than a few minutes, prefer wait_for_completion: false plus a "
+                f"{LONG_WAIT_OPERATOR_PAIRS[operator]} with mode: reschedule, which releases "
+                f"the worker between checks. For a short job, blocking is simpler."
+            )
+
+
+_annotate_catalog_with_cost_guidance(STEP_CATALOG)
 
 
 def list_pipeline_steps(search: str = "") -> dict:
@@ -351,7 +382,10 @@ def list_pipeline_steps(search: str = "") -> dict:
         if s and s not in key and s not in spec["what"].lower() and s not in spec["operator"].lower():
             continue
         fqn, _, _ = resolve_operator_fqn(spec["operator"])
-        out[key] = {**spec, "operator_fqn": fqn}
+        # deepcopy, not {**spec}: a shallow copy shares the nested `required` and
+        # `recommended` dicts with STEP_CATALOG, so a caller mutating the response
+        # corrupted the catalog for the lifetime of the process.
+        out[key] = {**copy.deepcopy(spec), "operator_fqn": fqn}
     return {"steps": out, "count": len(out)}
 
 
@@ -388,8 +422,8 @@ def plan_pipeline(steps, has_schedule: bool = False, creates_resources: bool = F
             "what": spec["what"],
             "operator": short,
             "operator_fqn": fqn,
-            "required_arguments": spec.get("required", {}),
-            "worth_setting": spec.get("recommended", {}),
+            "required_arguments": copy.deepcopy(spec.get("required", {})),
+            "worth_setting": copy.deepcopy(spec.get("recommended", {})),
             "xcom_output": spec.get("chains_via") or OPERATOR_XCOM_RETURNS.get(short, "No XCom output."),
             "note": spec.get("note"),
             "cost": spec.get("cost"),
@@ -515,17 +549,41 @@ def build_dag_yaml(
     if max_active_runs is not None:
         body["max_active_runs"] = max_active_runs
 
+    built, problems = {}, []
+    cost_applied = []
+    adjustments = []
+
     if default_args:
         da = copy.deepcopy(default_args)
-        if isinstance(da.get("retry_delay"), str):
-            da["retry_delay"] = 300
+        # default_args durations get the same treatment as task-level ones: parsed and
+        # reported, never silently replaced. The previous code turned ANY string
+        # retry_delay into 300, so a caller asking for "60s" got the 5-minute maximum
+        # with nothing in the response saying so.
+        for key in ("retry_delay", "execution_timeout"):
+            raw = da.get(key)
+            if raw is None or isinstance(raw, dict):
+                continue
+            secs = _duration_to_seconds(raw)
+            if secs is None:
+                problems.append(
+                    f"default_args.{key} must be a number of seconds or a duration like "
+                    f"'5m' (got {raw!r})."
+                )
+                continue
+            cap = (QUOTAS["max_retry_delay_seconds"] if key == "retry_delay"
+                   else QUOTAS["max_task_execution_timeout_minutes"] * 60)
+            capped = max(0, min(secs, cap))
+            da[key] = capped
+            if capped != secs or not isinstance(raw, int):
+                adjustments.append(
+                    f"default_args.{key} {raw!r} was set to {capped} seconds"
+                    + (f" (capped at the {cap}s maximum)." if capped != secs else ".")
+                )
         body["default_args"] = da
 
     if params:
         body["params"] = copy.deepcopy(params)
 
-    built, problems = {}, []
-    cost_applied = []
     for i, spec in enumerate(tasks):
         if not isinstance(spec, dict):
             problems.append(f"tasks[{i}] is not a mapping.")
@@ -561,14 +619,8 @@ def build_dag_yaml(
             tcfg[k] = v
 
         # Also accept operator arguments given directly on the spec.
-        _reserved = {
-            "task_id", "operator", "params", "parameters", "arguments", "dependencies",
-            "retries", "retry_delay_seconds", "retry_delay",
-            "execution_timeout_minutes", "execution_timeout", "trigger_rule",
-            "sensor_timeout_seconds",
-        }
         for k, v in spec.items():
-            if k not in _reserved and k not in tcfg:
+            if k not in _RESERVED_SPEC_KEYS and k not in tcfg:
                 tcfg[k] = v
 
         if spec.get("retries") is not None:
@@ -576,36 +628,103 @@ def build_dag_yaml(
 
         rd = spec.get("retry_delay_seconds", spec.get("retry_delay"))
         if rd is not None:
-            try:
-                tcfg["retry_delay"] = min(int(rd), QUOTAS["max_retry_delay_seconds"])
-            except (TypeError, ValueError):
-                problems.append(f"Task '{tid}': retry_delay_seconds must be an integer.")
+            secs = _duration_to_seconds(rd)
+            if secs is None:
+                problems.append(
+                    f"Task '{tid}': retry_delay_seconds must be an integer number of seconds "
+                    f"or a duration like '90s'/'5m' (got {rd!r})."
+                )
+            elif secs < 0:
+                problems.append(f"Task '{tid}': retry_delay_seconds cannot be negative (got {secs}).")
+            else:
+                capped = min(secs, QUOTAS["max_retry_delay_seconds"])
+                tcfg["retry_delay"] = capped
+                if capped != secs:
+                    # Capping used to happen silently, so a caller asking for 9999
+                    # got 300 with nothing in the report.
+                    adjustments.append(
+                        f"Task '{tid}': retry_delay {secs}s exceeds the "
+                        f"{QUOTAS['max_retry_delay_seconds']}s maximum and was capped to {capped}s."
+                    )
+                elif not isinstance(rd, int):
+                    adjustments.append(
+                        f"Task '{tid}': retry_delay {rd!r} was parsed as {capped} seconds."
+                    )
 
         etm = spec.get("execution_timeout_minutes")
         if etm is not None:
             try:
-                minutes = min(int(etm), QUOTAS["max_task_execution_timeout_minutes"])
-                tcfg["execution_timeout"] = {"__type__": "datetime.timedelta", "minutes": minutes}
+                requested = int(etm)
             except (TypeError, ValueError):
                 problems.append(f"Task '{tid}': execution_timeout_minutes must be an integer.")
+            else:
+                if requested < 1:
+                    problems.append(
+                        f"Task '{tid}': execution_timeout_minutes must be at least 1 (got {requested})."
+                    )
+                else:
+                    minutes = min(requested, QUOTAS["max_task_execution_timeout_minutes"])
+                    tcfg["execution_timeout"] = {"__type__": "datetime.timedelta",
+                                                 "minutes": minutes}
+                    if minutes != requested:
+                        adjustments.append(
+                            f"Task '{tid}': execution_timeout {requested}m exceeds the "
+                            f"{QUOTAS['max_task_execution_timeout_minutes']}m maximum and was "
+                            f"capped to {minutes}m."
+                        )
 
         if spec.get("trigger_rule"):
             tcfg["trigger_rule"] = spec["trigger_rule"]
 
-        deps = spec.get("dependencies")
-        if deps:
+        # Dependencies, accepting the aliases people reach for. Normalising here is
+        # what keeps `upstream_tasks` out of the emitted YAML.
+        deps, dep_source = None, None
+        for key in ("dependencies", *_DEP_ALIASES):
+            if spec.get(key) is not None:
+                deps, dep_source = spec[key], key
+                break
+        if deps is not None:
             if isinstance(deps, str):
                 deps = [deps]
-            tcfg["dependencies"] = list(deps)
+            if not isinstance(deps, list):
+                # A dict used to be silently coerced to its keys.
+                problems.append(
+                    f"Task '{tid}': dependencies must be a list of task_ids or a single "
+                    f"task_id string, not {type(deps).__name__}."
+                )
+            elif not all(isinstance(d, str) for d in deps):
+                problems.append(f"Task '{tid}': every entry in dependencies must be a task_id string.")
+            else:
+                tcfg["dependencies"] = list(deps)
+                if dep_source != "dependencies":
+                    adjustments.append(
+                        f"Task '{tid}': '{dep_source}' was renamed to 'dependencies' — "
+                        f"MWAA Serverless forwards any other spelling to the operator, "
+                        f"which fails."
+                    )
+        for key in _REVERSE_DEP_ALIASES:
+            if spec.get(key):
+                problems.append(
+                    f"Task '{tid}': '{key}' points the wrong way and has no YAML equivalent. "
+                    f"Declare the edge on the DOWNSTREAM task with 'dependencies: [{tid}]'."
+                )
 
         # Sensors get reschedule mode, a poke interval and a bounded wait, so a wait
         # never silently holds a worker for its full duration. An explicit value always
         # wins, so `params: {mode: poke}` opts out for a short wait.
         if is_sensor(fqn):
-            secs = spec.get("sensor_timeout_seconds")
+            sensor_timeout = None
+            raw_timeout = spec.get("sensor_timeout_seconds")
+            if raw_timeout is not None:
+                sensor_timeout = _duration_to_seconds(raw_timeout)
+                if sensor_timeout is None or sensor_timeout <= 0:
+                    problems.append(
+                        f"Task '{tid}': sensor_timeout_seconds must be a positive number of "
+                        f"seconds or a duration like '1h' (got {raw_timeout!r})."
+                    )
             for k, v in SENSOR_SAFETY_DEFAULTS.items():
                 if k not in tcfg:
-                    tcfg[k] = int(secs) if (k == "timeout" and secs) else v
+                    tcfg[k] = sensor_timeout if (k == "timeout" and sensor_timeout) else v
                     cost_applied.append(
                         f"Task '{tid}': set {k}: {tcfg[k]} — {_SENSOR_DEFAULT_REASONS.get(k, '')}"
                     )
@@ -619,7 +738,7 @@ def build_dag_yaml(
     result = validate(dag_yaml)
     missing = _collect_placeholder_warnings(built)
 
-    return {
+    out = {
         "dag_yaml": dag_yaml,
         "valid": result["valid"] and not problems,
         "build_problems": problems,
@@ -632,10 +751,16 @@ def build_dag_yaml(
         "next_step": (
             "Fix any errors, then call preflight_dag_yaml to have the service itself validate it, "
             "then generate_execution_role and mwaa_deploy_and_run."
-            if result["valid"] else
+            if result["valid"] and not problems else
             "Fix the errors above and rebuild."
         ),
     }
+    if adjustments:
+        # Every value the builder changed on the caller's behalf. Capping and
+        # renaming used to happen silently, so a caller could ask for a 9999s retry
+        # delay, receive 300, and have nothing in the response say so.
+        out["values_adjusted"] = adjustments
+    return out
 
 
 _PLACEHOLDER_HINTS = ("REPLACE", "CHANGEME", "your-", "my-bucket", "example", "amzn-s3-demo",
@@ -654,12 +779,20 @@ _SENSOR_DEFAULT_REASONS = {
 
 
 def _collect_placeholder_warnings(tasks) -> list:
-    """Flag obviously-placeholder values so they are never mistaken for real ones."""
+    """Flag obviously-placeholder values so they are never mistaken for real ones.
+
+    Walks NESTED values via the validator's traversal helper. Scanning only top-level
+    strings missed placeholders exactly where they live in practice — inside
+    script_args, job_driver, overrides and configuration_overrides.
+    """
     found = []
     for tid, tcfg in tasks.items():
-        for k, v in tcfg.items():
-            if isinstance(v, str) and any(h.lower() in v.lower() for h in _PLACEHOLDER_HINTS):
-                found.append(f"Task '{tid}'.{k} = {v!r} looks like a placeholder — confirm the real value.")
+        for path, value in _iter_strings(tcfg):
+            if any(h.lower() in value.lower() for h in _PLACEHOLDER_HINTS):
+                found.append(
+                    f"Task '{tid}'.{path} = {value!r} looks like a placeholder — "
+                    f"confirm the real value."
+                )
     return found
 
 
