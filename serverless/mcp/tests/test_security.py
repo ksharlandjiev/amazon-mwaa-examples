@@ -1574,3 +1574,106 @@ def test_the_data_flow_notice_names_the_way_to_turn_it_off(monkeypatch):
     notice = result["analysis_data_sent_to_bedrock"]
     assert "analyze=false" in notice
     assert "EnableFailureAnalysis=false" in notice
+
+
+
+# --- the README's security claims must stay true ----------------------------
+
+
+def _readme():
+    return (REPO_ROOT / "README.md").read_text()
+
+
+def _readme_flat():
+    """The README with line wraps collapsed, so a phrase can be searched for without
+    caring where the author happened to break the line."""
+    return re.sub(r"\s+", " ", _readme())
+
+
+def test_the_readme_recommends_local_first_on_security_grounds():
+    """The transport choice is a security decision, and the safer option has to be the
+    one a reader meets first."""
+    readme = _readme()
+    local = readme.index("### Option 1 — local stdio")
+    deployed = readme.index("### Option 2 — deploy to Lambda")
+    assert local < deployed, "local stdio must be presented first"
+
+    flat = _readme_flat()
+    intro = flat[flat.index("## Running it"):flat.index("### Option 1 — local stdio")]
+    assert "Run it locally unless you specifically need a shared endpoint" in intro
+    assert "security recommendation" in intro
+
+
+def test_the_readme_documents_the_remote_privilege_chain():
+    readme = _readme()
+    assert "## Security considerations for a remote deployment" in readme
+    section = readme[readme.index("## Security considerations for a remote deployment"):
+                     readme.index("## Client configuration")]
+    # The chain, link by link.
+    for link in ("lambda:InvokeFunctionUrl", "iam:PassRole",
+                 "airflow-serverless:CreateWorkflow", "s3:PutObject"):
+        assert link in section, f"{link} is missing from the privilege chain"
+    assert "Granting the first link grants the last" in section
+    # The things this sample does not do.
+    for gap in ("One role for every tool", "Attribution stops at the role",
+                "Arbitrary code arrives inline", "No idempotency tokens"):
+        assert gap in section, f"{gap!r} is not disclosed"
+
+
+def test_the_readme_does_not_repeat_the_abandoned_wildcard_absolute():
+    """"No Resource: '*' anywhere" was the claim that produced a non-functional policy.
+    It must not reappear as a selling point."""
+    readme = _readme()
+    for stale in ('no `Resource: "*"` anywhere',
+                  'a policy with **no** `Resource: "*"`',
+                  "empty — every bucket in the account"):
+        assert stale not in readme, f"stale claim back in the README: {stale!r}"
+
+
+def test_the_readme_states_both_code_bundle_ceilings():
+    readme = _readme()
+    assert "Code bundle (MWAA service quota)" in readme
+    assert "inline" in readme and "6 MB" in readme
+    assert "code_s3_key" in readme
+
+
+def test_the_readme_pins_the_signing_proxy():
+    """The proxy runs with the reader's AWS profile, so @latest means a new release can
+    start signing their requests without review."""
+    readme = _readme()
+    # Only the runnable lines matter. The prose deliberately mentions @latest to explain
+    # why it is not used, and a test that cannot tell those apart would forbid saying so.
+    runnable = [
+        line for line in readme.splitlines()
+        if "mcp-proxy-for-aws" in line and ("uvx mcp-proxy-for-aws" in line or '"args"' in line)
+    ]
+    assert runnable, "the proxy invocations disappeared from the README"
+    for line in runnable:
+        assert "@latest" not in line, f"unpinned proxy invocation: {line.strip()}"
+        assert "mcp-proxy-for-aws==" in line, f"unpinned proxy invocation: {line.strip()}"
+    assert len(runnable) >= 2, "pin every invocation, not just one"
+
+
+def test_the_readme_documents_the_preflight_delete_grant():
+    """This is an unconditional delete permission. A reader deploying it deserves to
+    know it exists and why."""
+    readme = _readme()
+    assert "preflight-*" in readme
+    assert "leak one workflow per call" in readme
+
+
+def test_every_internal_readme_link_resolves():
+    """A moved section leaves a link that silently goes nowhere."""
+    readme = _readme()
+    anchors = set()
+    for line in readme.splitlines():
+        if line.startswith("#"):
+            title = line.lstrip("#").strip()
+            slug = re.sub(r"[^\w\s-]", "", title.lower()).replace(" ", "-")
+            anchors.add(slug)
+
+    broken = [
+        target for target in re.findall(r"\]\(#([^)]+)\)", readme)
+        if target not in anchors
+    ]
+    assert not broken, f"broken internal links: {broken}"

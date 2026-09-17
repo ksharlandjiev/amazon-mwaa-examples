@@ -200,8 +200,8 @@ You need two things before step 4, and neither is created for you:
 
 1. `plan_pipeline(["glue_job", "glue_job", "glue_crawler", "athena_query"])` — get the operators, the questions to ask, and what was left out.
 2. Ask the user those questions, then `build_dag_yaml(...)` — correct-by-construction YAML, already validated. Check `values_adjusted` for anything it coerced or capped on your behalf.
-3. `generate_execution_role(account_id=…, region=…)` — a policy with **no** `Resource: "*"`, plus the CLI commands to create the role. Do this **before** preflight: preflight needs the role ARN.
-4. `preflight_dag_yaml(yaml, bucket, role_arn)` — the service validates it for real, then the throwaway workflow is deleted.
+3. `generate_execution_role(account_id=…, region=…)` — an ARN-scoped policy plus the CLI commands to create the role. Do this **before** preflight: preflight needs the role ARN. Read `how_to_scope_down`; if the DAG tears down what it creates, `teardown_tasks_affected` names the tasks that will fail until you pass `include_destructive_actions=True` (destruction is withheld by default).
+4. `preflight_dag_yaml(yaml, bucket, role_arn)` — the service validates it for real, then the throwaway workflow is deleted. Branch on `verdict`: `valid`, `invalid`, or `indeterminate` (the check could not be completed, so nothing is known — never read that as a pass).
 5. `mwaa_deploy_and_run(...)` — note this **updates** an existing workflow of the same name and starts a **billable** run.
 6. `mwaa_poll_run(...)` then **`mwaa_verify_run_tasks(...)`**.
 
@@ -460,19 +460,38 @@ is configured separately via `BEDROCK_REGION`, so the two do not have to match.
 
 ## Running it
 
-Two transports. Pick based on who needs to reach it.
+**Run it locally unless you specifically need a shared endpoint.** That is a security
+recommendation, not a convenience one, and it is the reason local stdio is first below.
+
+In local mode every AWS call is made with *your* credentials, so the server can do exactly
+what you can do and nothing more. There is no endpoint, no resource policy, and no shared
+role. If the tools misbehave, the damage is bounded by permissions you already hold, and
+CloudTrail attributes every call to you by name.
+
+Deploying to Lambda changes that in a way no amount of code can undo. The function needs
+`CreateWorkflow`, `s3:PutObject` and `iam:PassRole` to do its job, and it exposes tools
+that build a code bundle and deploy a workflow containing arbitrary Python or Bash.
+Composed, **anyone who can invoke the endpoint can run code under any role the function
+can pass** — including roles more privileged than the function itself. Every caller shares
+one execution role, so CloudTrail shows the role rather than the person. Deploy it when a
+team or a hosted agent genuinely needs shared access, with the parameters set and the
+invoke permission granted to one dedicated principal, and read
+[Security considerations for a remote deployment](#security-considerations-for-a-remote-deployment)
+first.
 
 | | Local stdio | Deployed Function URL |
 |---|---|---|
 | Network exposure | none | HTTPS endpoint |
 | Auth | your OS user | AWS IAM (SigV4) |
-| Calls run as | **you** | the **Lambda role** |
-| Blast radius | your own permissions | the function's permissions |
-| Setup | `pip install` | `sam deploy` |
+| Calls run as | **you** | the **Lambda role**, shared by all callers |
+| Blast radius | your own permissions | the function's permissions, for every caller |
+| Attribution in CloudTrail | your principal | the execution role |
+| Arbitrary code execution | under your own identity | under any passable role |
+| Setup | `pip install` | `sam deploy` + IAM parameters |
 | Model/config changes | edit a file | env var or redeploy |
-| Best for | individual development | shared team or hosted agent |
+| Best for | **individual development — start here** | shared team or hosted agent |
 
-### Option 1 — local stdio (recommended for individual use)
+### Option 1 — local stdio (recommended)
 
 Runs as a child process of your MCP client, like any other local MCP server. No endpoint,
 no URL to leak, no authorizer. Every AWS call is made as *you*, so the blast radius is
@@ -488,11 +507,22 @@ python local_server.py               # optional smoke test; Ctrl-C to stop
 
 It logs the resolved AWS identity and Region to stderr on startup, so a credential or
 Region mistake is obvious immediately. There is no AWS deployment — `sam build` and
-`sam deploy` are not used in this mode.
+`sam deploy` are not used in this mode, and nothing in `template.yaml` applies.
 
 Requires Python 3.10+ (the `mcp` package) and `boto3 >= 1.40`.
 
+Two consequences of running as yourself are worth knowing. Use least-privilege
+credentials, because the tools inherit whatever you hold — an admin session makes the
+delete tool as dangerous as your own console. And the inline code-bundle ceiling does not
+apply here: there is no request payload to fit inside, so the MWAA service quota is the
+only limit.
+
 ### Option 2 — deploy to Lambda with a Function URL
+
+Only worth doing when something other than your own machine needs to reach the server.
+Everything in
+[Security considerations for a remote deployment](#security-considerations-for-a-remote-deployment)
+applies.
 
 ```bash
 cd serverless/mcp
@@ -500,15 +530,18 @@ sam build
 sam deploy --guided     # first time; afterwards just: sam deploy
 ```
 
-`samconfig.toml` already pins `stack_name`, `region = "us-east-1"` and
+`WorkflowBucketName` is **required and has no default** — `sam deploy` fails until you
+supply it. That is deliberate: it used to accept an empty value and fall back to granting
+S3 access across every bucket in the account, so the easiest deploy produced the widest
+permissions.
+
+`samconfig.toml` pins `stack_name`, `region = "us-east-1"` and
 `capabilities = "CAPABILITY_IAM"`, so a plain `sam deploy` uses those — **change the
-region there or pass `--region`** rather than silently deploying to us-east-1. Read
-[Security considerations](#security-considerations) and set the scope-down parameters
-before you deploy anything you care about.
+region there or pass `--region`** rather than silently deploying to us-east-1.
 
 Take `McpFunctionUrl` from the Outputs, and check `S3AccessScope` in the same Outputs to
-confirm the function is not holding account-wide S3 access. The transport is a **Lambda Function URL with
-`AuthType: AWS_IAM`** — there is no API Gateway.
+confirm which bucket the function is scoped to. The transport is a **Lambda Function URL
+with `AuthType: AWS_IAM`** — there is no API Gateway.
 
 Redeploy after changing code:
 
@@ -529,6 +562,164 @@ output prints it with your function ARN already filled in:
 ```json
 { "Effect": "Allow", "Action": "lambda:InvokeFunctionUrl", "Resource": "<McpFunctionArn>" }
 ```
+
+The proxy examples below pin an exact version. It runs in a process that receives your AWS
+profile, so resolving it at `@latest` on every launch means a new release can start signing
+your requests without review. Check for newer versions deliberately:
+`uvx pip index versions mcp-proxy-for-aws`.
+
+## Security considerations for a remote deployment
+
+None of this applies to local stdio, where the tools run under your own credentials and
+there is no endpoint. It all applies the moment you `sam deploy`.
+
+### Endpoint authentication
+
+- **`AuthType: AWS_IAM` is on by default.** Unsigned requests get `403 Forbidden`; SigV4
+  signed requests get `200`. No anonymous path exists — with `AuthType: NONE`, SAM would
+  add a `lambda:InvokeFunctionUrl` permission with `Principal: *`, and that permission is
+  absent.
+- **The URL is not a secret.** It appears in CloudFormation outputs, MCP config files,
+  shell history and CI logs. Authentication, not obscurity, is what protects it.
+- **IAM auth does not separate privileged principals.** `lambda:InvokeFunctionUrl` is
+  included in `AdministratorAccess` and `PowerUserAccess`, so in an account where everyone
+  is an admin this blocks the internet but not your colleagues. Grant a dedicated invoke
+  role if you need that distinction:
+
+  ```bash
+  aws iam create-role --role-name mcp-invoker \
+    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+      "Principal":{"AWS":"arn:aws:iam::<ACCOUNT>:user/<YOU>"},"Action":"sts:AssumeRole"}]}'
+  aws iam put-role-policy --role-name mcp-invoker --policy-name invoke \
+    --policy-document "$(aws cloudformation describe-stacks \
+      --stack-name mwaa-serverless-mcp \
+      --query 'Stacks[0].Outputs[?OutputKey==`InvokePolicyHint`].OutputValue' \
+      --output text | python3 -c 'import json,sys; print(json.dumps({"Version":"2012-10-17","Statement":[json.load(sys.stdin)]}))')"
+  ```
+- **Signing needs live credentials.** Static temporary credentials in environment
+  variables stop working at expiry; a profile with SSO or role refresh does not.
+
+### The privilege chain is the whole risk
+
+```text
+lambda:InvokeFunctionUrl
+  -> the Lambda execution role
+  -> s3:PutObject (workflow definition + code bundle)
+  -> airflow-serverless:CreateWorkflow / UpdateWorkflow
+  -> iam:PassRole
+  -> your Python or Bash running under the passed role
+```
+
+Granting the first link grants the last. `AuthType: AWS_IAM` stops anonymous access and
+nothing else — an authorized caller reaches the end of that chain by design, because
+deploying workflows that run code *is* the function's job. Treat
+`lambda:InvokeFunctionUrl` on this function as equivalent to handing over the passable
+roles, and grant it to one dedicated principal rather than to everyone with broad
+administrator access.
+
+### Constrain every link
+
+| Parameter | Default | What it limits |
+|---|---|---|
+| `WorkflowBucketName` | **required** | S3 reads and writes to one bucket, in this account |
+| `PassableExecutionRolePath` | `mwaa-serverless-*` | which roles can be passed. Narrow it to exact role names. |
+| `AllowWorkflowDeletion` | `false` | removes `DeleteWorkflow` for the delete tool |
+| `EnableFailureAnalysis` | `true` | removes `bedrock:InvokeModel` when false |
+| `ReservedConcurrentExecutions` | `5` | caps runaway cost and abuse rate |
+
+`PassableExecutionRolePath` is the one that matters most. It defaults to a name prefix,
+which is a real constraint only if no over-privileged role in the account happens to match
+it. Auditing that is worth more than tightening any other parameter. Never widen it to
+`*`: the `iam:PassedToService` condition limits which *service* receives the role, not
+which role can be passed, so `*` makes every role in the account passable — including an
+`AdministratorAccess` role.
+
+Consider a permission boundary on the roles this function can pass, so a later
+configuration mistake cannot turn one of them into an administrator.
+
+### What this sample deliberately does not do
+
+Be aware of these before treating a deployment as production infrastructure:
+
+- **One role for every tool.** Read-only discovery, deployment and deletion all execute
+  under the same execution role, and there is no per-caller or per-tool authorization in
+  the dispatch path. A production build should split the tool surface across separate
+  functions and roles — read-only, start/stop, deploy, administer — so that reaching the
+  endpoint does not confer everything at once. That is a redesign, not a parameter.
+- **Attribution stops at the role.** Downstream CloudTrail events name the execution role,
+  not the caller who triggered them. If you need to know who deployed what, log the
+  authenticated principal per tool call before dispatch, or use local stdio where every
+  call is already attributed.
+- **Arbitrary code arrives inline.** `mwaa_deploy_and_run` accepts a base64 code bundle
+  from the caller. A stricter pattern is to have CI place immutable artifacts in a fixed
+  S3 prefix and pass only `code_s3_key`, so no code travels through the endpoint.
+- **Deployment is all-at-once.** There is no alias, canary or alarm-gated rollback, so a
+  broken release takes all traffic immediately. Add `AutoPublishAlias` and a
+  `DeploymentPreference` if this becomes something you depend on.
+- **No idempotency tokens.** A retried or duplicated request can overwrite a definition
+  and start a second run. `mwaa_deploy_and_run` also turns a name conflict into an update
+  of the existing workflow.
+
+### Data flow
+
+`mwaa_get_failed_runs` sends CloudWatch task log excerpts to Bedrock by default, and the
+default model chain leads with cross-Region inference profiles, so that content may be
+processed outside your Region. Credential-shaped values are redacted first, but resource
+names, ARNs and account ids are not — they are the diagnostic content. The four ways to
+control this are in the table under [Where a model is (and is not)
+involved](#where-a-model-is-and-is-not-involved); `EnableFailureAnalysis=false` is the
+only one that removes the permission.
+
+Treat the returned analysis as an untrusted suggestion. Task logs are arbitrary text
+written by whatever runs in a task, so they can contain instructions aimed at the model or
+at the agent reading its reply. The response labels it accordingly, and the `failures`
+list is the authoritative evidence.
+
+### Tools that mutate, delete or cost money
+
+These matter in both transports, but a shared endpoint means someone else can invoke them.
+
+- **`mwaa_delete_workflows` targets EVERY workflow in the account when called with no
+  filter** — not just the ones this server created. It previews by default, and an
+  unfiltered non-dry-run call is **refused**: deleting everything requires
+  `confirm_delete_all=true`. Always pass `name_contains` or `not_run_in_days`, and read the
+  dry-run list before passing `dry_run=false`.
+- **Three tools mutate or bill.** `mwaa_deploy_and_run` **updates** an existing workflow of
+  the same name and starts a billable run; `mwaa_redeploy` overwrites the deployed
+  definition and the S3 object behind it, then reruns; `mwaa_stop_run` kills an in-flight
+  run. All three require an **exact** workflow name — a partial match is refused, because
+  overwriting the wrong workflow is unrecoverable.
+- **`preflight_dag_yaml` creates and deletes a throwaway workflow** to obtain the service's
+  own verdict. It occupies one of the 100 workflow slots for a few seconds and writes then
+  deletes two objects in the bucket you name. The delete is permitted even when
+  `AllowWorkflowDeletion=false`, via a grant scoped to the `preflight-*` name prefix —
+  withholding it would not make preflight safe, it would make it leak one workflow per
+  call. The CloudWatch log group the service creates for the throwaway does outlive it and
+  is named in `log_group_residue`.
+- **All S3 writes use SSE-S3 and assert bucket ownership.** On a deployment the owning
+  account comes from the stack, so a caller cannot substitute its own claim. Locally there
+  is no stack, so pass `expected_bucket_owner` on `mwaa_deploy_and_run`, `mwaa_redeploy`
+  and `preflight_dag_yaml` yourself.
+
+### Local files
+
+**Never commit `src/mcp_config.json`.** It is git-ignored. Keep secrets out of it
+regardless — it holds configuration, not credentials.
+
+### Why there is no API Gateway
+
+It contributed nothing: one route with no authorizer in front of one Lambda. It also could
+not be secured in place — `AWS::Serverless::HttpApi` cannot express IAM authorization at
+all. `Auth: DefaultAuthorizer: AWS_IAM` is a REST API feature and SAM rejects it on an HTTP
+API with *"Unable to set DefaultAuthorizer because 'AWS_IAM' was not defined in
+'Authorizers'"*. Removing it also lifted two constraints:
+
+- **Resource-level controls.** HTTP APIs do not support resource policies, so restricting
+  by source IP or caller principal was impossible. A Function URL is governed by ordinary
+  IAM.
+- **The 29-second ceiling.** API Gateway capped every request at 29s, which is why
+  `mwaa_poll_run` had to give up after 25s and be called repeatedly. The Lambda timeout is
+  now 120s and a single poll waits up to 110s, so most task transitions finish in one call.
 
 ## Client configuration
 
@@ -565,7 +756,7 @@ Remote:
   "mcpServers": {
     "mwaa-serverless": {
       "command": "uvx",
-      "args": ["mcp-proxy-for-aws@latest", "https://<id>.lambda-url.us-east-1.on.aws/"],
+      "args": ["mcp-proxy-for-aws==1.7.0", "https://<id>.lambda-url.us-east-1.on.aws/"],
       "env": { "AWS_PROFILE": "your-profile", "AWS_REGION": "us-east-1" },
       "disabled": false
     }
@@ -607,7 +798,7 @@ claude mcp add mwaa-serverless \
 # remote
 claude mcp add mwaa-serverless \
   --env AWS_PROFILE=your-profile --env AWS_REGION=us-east-1 \
-  -- uvx mcp-proxy-for-aws@latest https://<id>.lambda-url.us-east-1.on.aws/
+  -- uvx mcp-proxy-for-aws==1.7.0 https://<id>.lambda-url.us-east-1.on.aws/
 ```
 
 ### Cursor / Windsurf / other stdio clients
@@ -620,115 +811,6 @@ shape as the Kiro examples.
 Ask the agent to call `get_server_config`. It returns the effective configuration and
 confirms the transport is reachable. `list_supported_operators` is a good second check —
 it needs no AWS credentials, so a failure there points at the MCP wiring rather than IAM.
-
-## Security considerations
-
-**Local stdio is the safer default.** There is no listener, and tools act with your own
-credentials, so a caller can never exceed what you can already do.
-
-**The deployed Function URL inverts that.** Callers act with the *function's* permissions,
-which are broader than most individuals need: `CreateWorkflow`, `UpdateWorkflow`,
-`DeleteWorkflow`, `iam:PassRole` and S3 read/write. Treat invoke access as equivalent to
-granting all of that.
-
-- **`AuthType: AWS_IAM` is on by default.** Unsigned requests get `403 Forbidden`; SigV4
-  signed requests get `200`. No anonymous path exists — with `AuthType: NONE`, SAM would
-  add a `lambda:InvokeFunctionUrl` permission with `Principal: *`, and that permission is
-  absent.
-- **The URL is not a secret.** It appears in CloudFormation outputs, MCP config files,
-  shell history and CI logs. Authentication, not obscurity, is what protects it.
-- **IAM auth does not separate privileged principals.** `lambda:InvokeFunctionUrl` is
-  included in `AdministratorAccess` and `PowerUserAccess`, so in an account where everyone
-  is an admin this blocks the internet but not your colleagues. Grant a dedicated invoke
-  role if you need that distinction.
-- **⚠ Anyone who can invoke this endpoint can run arbitrary code under any passable
-  role.** This is the finding to understand before you deploy, and it is not merely "broad
-  permissions". The function holds `CreateWorkflow`, `s3:PutObject` and `iam:PassRole`, and
-  it exposes `build_code_bundle` plus `mwaa_deploy_and_run(code_zip_base64=…)`, which run
-  `PythonOperator`/`BashOperator` code on a worker. Composed, an authorized caller can
-  deploy a workflow that executes their code under **any role in the account that is
-  passable to `airflow-serverless.amazonaws.com`** — including roles far more privileged
-  than this function. That is a lateral-movement primitive. Narrow it with the template
-  parameters below, and grant `lambda:InvokeFunctionUrl` to one dedicated principal.
-- **Scope the function's policy down with the stack parameters.** The template ships with
-  **no `Resource: "*"` anywhere**, but two defaults are deliberately loose so a first
-  deploy works. Set them:
-
-  | Parameter | Default | Set it to |
-  |---|---|---|
-  | `WorkflowBucketName` | *(empty — every bucket in the account)* | the one bucket you use |
-  | `PassableExecutionRolePath` | `mwaa-serverless-*` | the narrowest prefix, or one role name |
-  | `AllowWorkflowDeletion` | `false` | leave false unless you need the delete tool |
-  | `EnableFailureAnalysis` | `true` | `false` if your task logs must not leave the account |
-
-  ```bash
-  sam deploy --parameter-overrides \
-    WorkflowBucketName=my-workflow-bucket \
-    PassableExecutionRolePath='mwaa-serverless-*' \
-    AllowWorkflowDeletion=false \
-    EnableFailureAnalysis=true
-  ```
-
-  The first three are about **blast radius** — what an authorized caller can reach.
-  `EnableFailureAnalysis` is a different question: it is about **data flow**, not damage.
-  It grants no write access and destroys nothing; it decides whether CloudWatch task log
-  excerpts may be sent to Bedrock, possibly cross-Region. It defaults to `true` so the
-  feature works on a first deploy. See
-  [the data-flow callout](#where-a-model-is-and-is-not-involved) for the four ways to
-  control it, and turn it off if your logs are sensitive.
-
-  The `S3AccessScope` output tells you whether the deployed function ended up scoped or
-  not. Note that `iam:PassedToService` constrains which **service** receives a role, not
-  which role may be passed — both conditions are needed, and the template sets both.
-- **Grant invoke access to one principal, not to everyone who is an admin.**
-
-  ```bash
-  aws iam create-role --role-name mcp-invoker \
-    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-      "Principal":{"AWS":"arn:aws:iam::<ACCOUNT>:user/<YOU>"},"Action":"sts:AssumeRole"}]}'
-  aws iam put-role-policy --role-name mcp-invoker --policy-name invoke \
-    --policy-document "$(aws cloudformation describe-stacks \
-      --stack-name mwaa-serverless-mcp \
-      --query 'Stacks[0].Outputs[?OutputKey==`InvokePolicyHint`].OutputValue' \
-      --output text | python3 -c 'import json,sys; print(json.dumps({"Version":"2012-10-17","Statement":[json.load(sys.stdin)]}))')"
-  ```
-- **`mwaa_delete_workflows` targets EVERY workflow in the account when called with no
-  filter.** Not just the ones this server created. It previews by default, and an
-  unfiltered non-dry-run call is now **refused** — deleting everything requires
-  `confirm_delete_all=true`. Always pass `name_contains` or `not_run_in_days`, and read the
-  dry-run list before passing `dry_run=false`.
-- **Three other tools mutate or cost money.** `mwaa_deploy_and_run` **updates** an existing
-  workflow of the same name and starts a billable run; `mwaa_redeploy` overwrites the
-  deployed definition and the S3 object behind it, then reruns; `mwaa_stop_run` kills an
-  in-flight run. All three now require an **exact** workflow name — a partial match is
-  refused, because overwriting the wrong workflow is unrecoverable.
-- **Signing needs live credentials.** Static temporary credentials in environment
-  variables stop working at expiry; a profile with SSO or role refresh does not.
-- **Never commit `src/mcp_config.json`.** It is git-ignored. Keep secrets out of it
-  regardless — it holds configuration, not credentials.
-- **`preflight_dag_yaml` creates and deletes a throwaway workflow** to obtain the
-  service's own verdict. It counts against the 100-workflow quota for a few seconds, and
-  writes then deletes two objects in the bucket you name. If cleanup fails, the response
-  names the leftover workflow and objects so you can remove them.
-- **Pass `expected_bucket_owner` on the tools that write to S3.** `mwaa_deploy_and_run`,
-  `mwaa_redeploy` and `preflight_dag_yaml` accept it and forward it as
-  `ExpectedBucketOwner`, so the upload fails instead of writing into a bucket you do not
-  own. All writes use SSE-S3 encryption.
-
-### Why there is no API Gateway
-
-It contributed nothing: one route with no authorizer in front of one Lambda. It also could
-not be secured in place — `AWS::Serverless::HttpApi` cannot express IAM authorization at
-all. `Auth: DefaultAuthorizer: AWS_IAM` is a REST API feature and SAM rejects it on an HTTP
-API with *"Unable to set DefaultAuthorizer because 'AWS_IAM' was not defined in
-'Authorizers'"*. Removing it also lifted two constraints:
-
-- **Resource-level controls.** HTTP APIs do not support resource policies, so restricting
-  by source IP or caller principal was impossible. A Function URL is governed by ordinary
-  IAM.
-- **The 29-second ceiling.** API Gateway capped every request at 29s, which is why
-  `mwaa_poll_run` had to give up after 25s and be called repeatedly. The Lambda timeout is
-  now 120s and a single poll waits up to 110s, so most task transitions finish in one call.
 
 ## What this sample costs
 
@@ -746,7 +828,7 @@ about running the server itself. Nothing here is free-tier guaranteed; see the
 - **MWAA Serverless is the real cost.** `preflight_dag_yaml`, `mwaa_deploy_and_run` and
   `mwaa_redeploy` create **real** workflows and start **real** runs, billed for the time
   each task occupies a worker.
-- **S3:** definitions are small; code bundles can be up to 250 MB each.
+- **S3:** definitions are small; code bundles can be up to 250 MB each (but see the inline limit below — a bundle passed through a deployed endpoint is capped far lower).
 - **CloudWatch Logs:** ingestion and storage for your workflows' task logs, plus this
   function's own logs (retention is set by the `LogRetentionDays` parameter, default 30 —
   an implicitly created Lambda log group would never expire).
@@ -816,7 +898,8 @@ sam delete --stack-name mwaa-serverless-mcp
 | Concurrent runs per account / per workflow | 100 / 20 |
 | XCom value | 100 KB |
 | DAG definition | 50 KB |
-| Code bundle | 250 MB (75 GB per account) |
+| Code bundle (MWAA service quota) | 250 MB (75 GB per account) |
+| Code bundle passed **inline** to a deployed server | ~4.5 MB — a Lambda request is capped at 6 MB and base64 inflates by a third. Upload to S3 and pass `code_s3_key` instead. No such limit in local stdio mode. |
 | Task execution timeout | 60 minutes |
 | Retries per task | 0–3 |
 | Retry delay | 0–300 seconds |
@@ -846,6 +929,7 @@ serverless/mcp/
     └── requirements-local.txt  # adds `mcp` for local stdio mode
 ├── pytest.ini
 ├── ruff.toml
+├── verify_generated_policies.py  # simulates generated IAM against live IAM (needs creds)
 └── tests/                  # no test calls AWS
     ├── conftest.py
     ├── test_validator.py            # schema rules + untrusted-input bounds
@@ -878,9 +962,10 @@ exactly these three and that nothing destructive joins it.
 | `airflow-serverless:ListWorkflows`, `CreateWorkflow` | `*` — collection-level, see above | Discover workflows; create one |
 | `airflow-serverless:GetWorkflow`, `GetWorkflowRun`, `ListWorkflowRuns`, `ListWorkflowVersions` | `…:workflow/*` in this account+Region | Read a workflow and its runs |
 | `airflow-serverless:UpdateWorkflow`, `StartWorkflowRun`, `StopWorkflowRun` | `…:workflow/*` in this account+Region | Deploy and run |
-| `airflow-serverless:DeleteWorkflow` | same — **omitted unless `AllowWorkflowDeletion=true`** | The delete tool |
-| `s3:GetObject/PutObject/DeleteObject` | `WorkflowBucketName/*`, else every bucket | Definitions and code bundles; preflight cleanup |
-| `s3:ListBucket/GetBucketLocation` | `WorkflowBucketName`, else every bucket | Same |
+| `airflow-serverless:DeleteWorkflow` | `…:workflow/preflight-*` — **always granted** | Lets preflight delete its own throwaway. Withholding it would leak one workflow per call. |
+| `airflow-serverless:DeleteWorkflow` | `…:workflow/*` — **omitted unless `AllowWorkflowDeletion=true`** | The delete tool |
+| `s3:GetObject/PutObject/DeleteObject` | `WorkflowBucketName/*`, with `s3:ResourceAccount` | Definitions and code bundles; preflight cleanup |
+| `s3:ListBucket/GetBucketLocation` | `WorkflowBucketName`, with `s3:ResourceAccount` | Same |
 | `logs:DescribeLogGroups` | `*` — collection-level, see above | Find a workflow's log group |
 | `logs:DescribeLogStreams`, `logs:GetLogEvents` | `log-group:/aws/mwaa-serverless/*` | Per-task outcome verification |
 | `bedrock:InvokeModel` | foundation models + inference profiles in this Region — **omitted when `EnableFailureAnalysis=false`** | Failure root-cause analysis. Granted by default; see the data-flow callout. |
@@ -889,7 +974,7 @@ exactly these three and that nothing destructive joins it.
 The two conditions on `iam:PassRole` do different jobs and you need both:
 `iam:PassedToService` limits which **service** receives the role; the `Resource` pattern
 limits **which role** can be passed. With only the first, any role in the account is
-passable — see [Security considerations](#security-considerations).
+passable — see [Security considerations for a remote deployment](#security-considerations-for-a-remote-deployment).
 
 Callers of the deployed endpoint need only `lambda:InvokeFunctionUrl` on the function.
 In local stdio mode there is no endpoint, and the tools use your own credentials, so
@@ -917,11 +1002,30 @@ These four checks run in CI on any change under `serverless/mcp/`
 workflow is path-scoped to this directory, needs no AWS credentials, and is expected to
 stay at zero findings rather than carry a baseline of accepted ones.
 
-Passing all four is necessary but not sufficient. Three real defects in this sample were
+Passing all four is necessary but not sufficient. Several real defects in this sample were
 invisible to every one of them and only surfaced by deploying and running against the
 service: an IAM policy that lints clean but denies at run time, an operator that writes no
-log stream, and a false positive on the documented XCom idiom. Run a live workflow before
-trusting a change to the IAM generator, the log readers, or the validator.
+log stream, a false positive on the documented XCom idiom, and preflight leaking a workflow
+on every call because the delete permission it needs was gated off by default. Run a live
+workflow before trusting a change to the IAM generator, the log readers, or the validator.
+
+One of those was actively held in place by a test. It asserted that no generated policy may
+use `Resource: "*"`, which is precisely the broken form for actions IAM refuses to scope —
+so the suite demanded the bug. When a test encodes an absolute, check that the absolute is
+true before trusting the green.
+
+`verify_generated_policies.py` closes part of that gap by asking IAM itself:
+
+```bash
+python verify_generated_policies.py          # all 29 demo policies
+python verify_generated_policies.py ec2 s3   # or just these
+```
+
+It uses `iam:SimulateCustomPolicy`, which evaluates a policy document against the real
+authorisation engine without attaching it to anything — no role, policy or resource is
+created. It checks both directions: an action scoped to an ARN that IAM would deny, and an
+action granted `"*"` that an ARN would in fact have authorised. It needs credentials, so it
+is not part of CI.
 
 ## License and contributing
 
