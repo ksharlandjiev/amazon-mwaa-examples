@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """
 Validation and auto-repair for MWAA Serverless DAG YAML.
 
@@ -14,6 +17,7 @@ will deploy and then fail at run time.
 
 import copy
 import re
+from datetime import date, datetime
 
 import yaml
 
@@ -45,11 +49,44 @@ from schema import (
     resolve_operator_fqn,
 )
 
-_TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
-_DAG_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
-_JINJA_VAR_RE = re.compile(r"\{\{[-\s]*([a-zA-Z_][a-zA-Z0-9_.]*)")
+_TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]+\Z")
+_DAG_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]+\Z")
+# Jinja expression ({{ }}) and statement ({% %}) blocks. Both are scanned: a
+# variable used inside {% if %} is just as unavailable as one inside {{ }}.
+_JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.S)
+_JINJA_STRING_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_JINJA_DOTTED_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_JINJA_FILTER_RE = re.compile(r"\|\s*([A-Za-z_][A-Za-z0-9_]*)")
+_JINJA_BINDING_RE = re.compile(
+    r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s+in\b"
+    r"|\bset\s+([A-Za-z_][A-Za-z0-9_]*)\s*="
+)
+# A name immediately followed by a single '=' is a KEYWORD ARGUMENT, not a variable
+# reference: in the documented XCom idiom
+# "{{ ti.xcom_pull(task_ids='upstream') }}", `task_ids` is an argument name. Reporting
+# it as an unrecognised Jinja variable produced a false warning on the one expression
+# the schema docs tell people to write. `==`, `<=`, `>=` and `!=` are comparisons and
+# must NOT be treated this way.
+_JINJA_KWARG_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=])")
+# Jinja/Python keywords and literals that are not variable references.
+_JINJA_KEYWORDS = {
+    "and", "or", "not", "in", "is", "if", "else", "elif", "endif", "for", "endfor",
+    "set", "endset", "true", "false", "none", "True", "False", "None", "with",
+    "without", "context", "block", "endblock", "raw", "endraw", "filter",
+    "endfilter", "macro", "endmacro", "call", "endcall", "do", "recursive",
+    "loop", "as", "import", "from", "include", "extends", "trim", "safe",
+}
 _XCOM_PULL_RE = re.compile(r"xcom_pull\s*\(([^)]*)\)")
 _XCOM_TASKIDS_RE = re.compile(r"task_ids\s*=\s*[\"']([^\"']+)[\"']")
+# Airflow's @presets, and enough cron syntax to reject nonsense without
+# reimplementing croniter.
+_SCHEDULE_PRESETS = {
+    "@once", "@hourly", "@daily", "@weekly", "@monthly", "@yearly", "@annually",
+    "@continuous", "@midnight",
+}
+_CRON_FIELD_RE = re.compile(r"^(\*|[0-9,\-*/]+|[A-Za-z]{3}(?:-[A-Za-z]{3})?)(/\d+)?$")
+_CRON_FIELD_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+
 _DURATION_RE = re.compile(r"^(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$", re.I)
 
 _DURATION_UNITS = {
@@ -71,12 +108,6 @@ _NO_XCOM_OPERATORS = {
     "CloudFormationCreateStackSensor": "sensors of this type return None",
     "CloudFormationDeleteStackSensor": "sensors of this type return None",
     "EmptyOperator": "it does nothing and returns None",
-}
-
-# Task keys that dag-factory consumes itself instead of forwarding to the operator.
-_STRUCTURAL_TASK_KEYS = {
-    "operator", "dependencies", "task_id", "retries", "retry_delay",
-    "execution_timeout", "trigger_rule",
 }
 
 # Alternative dependency spellings that people (and LLMs) reach for. All of them
@@ -122,16 +153,128 @@ def _timedelta_seconds(value):
     return total
 
 
-def _iter_strings(obj, path=""):
-    """Yield (path, string) for every string in a nested structure."""
+# Untrusted-input bounds.
+#
+# A definition arrives from an LLM or a user, so both its SIZE and its expanded
+# COMPLEXITY have to be bounded, and they are different problems:
+#
+#   size      — caught by QUOTAS["max_dag_definition_kb"] below, which now returns
+#               immediately instead of falling through to parse the oversize input.
+#   expansion — yaml.safe_load resolves aliases by SHARING the referenced object, so
+#               parsing stays cheap while the logical tree explodes. 477 bytes of
+#               nested anchors expands to ~10^7 nodes; walking it structurally, once
+#               per task, took 2.7s and grows 10x per 50 added bytes. A byte limit
+#               cannot see this, so every structural walk draws from a shared node
+#               budget and reports truncation rather than running to completion.
+_MAX_TRAVERSAL_NODES = 200_000
+# Depth guard for the same walk: an alias chain can also nest far deeper than any
+# real definition, and Python has no tail calls.
+_MAX_TRAVERSAL_DEPTH = 100
+
+
+class _NodeBudget:
+    """A shared allowance for structural traversal of untrusted YAML.
+
+    One budget per validate()/repair() call, so total work is bounded by the budget
+    rather than by (tasks x nodes-per-task). `exhausted` is surfaced to the caller as
+    an error: an analysis that silently stopped early must not read as a clean pass.
+    """
+
+    __slots__ = ("remaining", "exhausted", "too_deep")
+
+    def __init__(self, limit=_MAX_TRAVERSAL_NODES):
+        self.remaining = limit
+        self.exhausted = False
+        self.too_deep = False
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            self.exhausted = True
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _jinja_identifiers(s: str):
+    """Every variable reference inside a string's Jinja blocks, in order.
+
+    Handles what a "first identifier after {{" regex could not:
+      - variables used mid-expression: "{{ params.x or execution_date }}" yields both
+      - statement blocks: "{% if dag_run %}" yields dag_run
+      - filters, string literals, keywords and loop/set bindings are excluded, so a
+        legitimate "{% for f in params.files %}{{ f }}{% endfor %}" reports nothing
+    """
+    out = []
+    seen = set()
+    bound = set()
+
+    for m in _JINJA_BLOCK_RE.finditer(s):
+        body = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        for b in _JINJA_BINDING_RE.finditer(body):
+            names = b.group(1) or b.group(2) or ""
+            bound.update(n.strip() for n in names.split(",") if n.strip())
+
+    for m in _JINJA_BLOCK_RE.finditer(s):
+        body = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        # Drop string literals so a bucket name inside quotes is not read as a variable.
+        body = _JINJA_STRING_RE.sub(" ", body)
+        filters = set(_JINJA_FILTER_RE.findall(body))
+        kwargs = set(_JINJA_KWARG_RE.findall(body))
+        for name_match in _JINJA_DOTTED_NAME_RE.finditer(body):
+            name = name_match.group(0)
+            root = name.split(".")[0]
+            if root in _JINJA_KEYWORDS or root in bound or root in filters:
+                continue
+            # Keyword-argument names are not variable references.
+            if name in kwargs:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _iter_strings(obj, path="", budget=None, depth=0):
+    """Yield (path, string) for every string in a nested structure.
+
+    Bounded by `budget` and by _MAX_TRAVERSAL_DEPTH. Callers that pass no budget get
+    an unshared one; callers validating a whole definition should pass a single budget
+    so one pathological task cannot consume the analysis of the others.
+    """
+    if budget is None:
+        budget = _NodeBudget()
+    if depth > _MAX_TRAVERSAL_DEPTH:
+        budget.too_deep = True
+        return
+    if not budget.take():
+        return
     if isinstance(obj, str):
         yield path, obj
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            yield from _iter_strings(v, f"{path}.{k}" if path else str(k))
+            yield from _iter_strings(v, f"{path}.{k}" if path else str(k), budget, depth + 1)
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
-            yield from _iter_strings(v, f"{path}[{i}]")
+            yield from _iter_strings(v, f"{path}[{i}]", budget, depth + 1)
+
+
+def _budget_error(budget, what="definition"):
+    """The error to report when a traversal stopped early, or None."""
+    if budget.exhausted:
+        return (
+            f"This {what} expands to more than {_MAX_TRAVERSAL_NODES:,} nodes, so it was not "
+            f"fully analysed and must not be treated as validated. This is almost always "
+            f"YAML anchors/aliases (`&a`/`*a`) expanding exponentially — MWAA Serverless "
+            f"resolves them too, so the deployed definition would be just as large. Inline "
+            f"the values you actually need, or move bulk data into an S3 object."
+        )
+    if budget.too_deep:
+        return (
+            f"This {what} nests deeper than {_MAX_TRAVERSAL_DEPTH} levels, so it was not fully "
+            f"analysed. Flatten it; no valid DAG definition is this deep."
+        )
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -146,13 +289,26 @@ def validate(yaml_content: str) -> dict:
     best-practice observations.
     """
     errors, warnings, hints = [], [], []
+    # One traversal allowance for the whole call, so a definition cannot make the
+    # analysis unboundedly expensive by multiplying tasks by alias expansion.
+    budget = _NodeBudget()
 
     size_kb = len(yaml_content.encode("utf-8")) / 1024
     if size_kb > QUOTAS["max_dag_definition_kb"]:
-        errors.append(
-            f"Definition is {size_kb:.1f} KB, over the {QUOTAS['max_dag_definition_kb']} KB limit. "
-            f"Move inline scripts and templates into S3 objects and reference them."
-        )
+        # Return immediately. Previously this only appended and fell through, so an
+        # oversize definition was still fully parsed and walked — which is how a
+        # 1.28 MB / 20,000-task input got validated in full, and how a long
+        # dependency chain reached the recursive graph walks and raised
+        # RecursionError out of this function.
+        return {
+            "valid": False,
+            "errors": [
+                f"Definition is {size_kb:.1f} KB, over the {QUOTAS['max_dag_definition_kb']} KB "
+                f"limit, and was not analysed. Move inline scripts and templates into S3 objects "
+                f"and reference them."
+            ],
+            "warnings": [], "hints": [], "summary": {},
+        }
 
     try:
         data = yaml.safe_load(yaml_content)
@@ -206,8 +362,26 @@ def validate(yaml_content: str) -> dict:
             errors.append(f"DAG '{dag_id}': 'tasks' must be a mapping, got {type(tasks).__name__}.")
             continue
 
-        summary["task_count"] = len(tasks)
-        _validate_tasks(dag_id, tasks, errors, warnings, hints, summary)
+        if not tasks:
+            # An empty mapping previously passed as valid, so a converter that
+            # produced no tasks reported a deployable workflow that does nothing.
+            errors.append(
+                f"DAG '{dag_id}': 'tasks' is empty. A workflow needs at least one task."
+            )
+            continue
+
+        if len(tasks) > QUOTAS["max_tasks_per_workflow"]:
+            errors.append(
+                f"DAG '{dag_id}' has {len(tasks)} tasks, over the "
+                f"{QUOTAS['max_tasks_per_workflow']} per-workflow limit."
+            )
+
+        summary["task_count"] += len(tasks)
+        _validate_tasks(dag_id, tasks, errors, warnings, hints, summary, budget)
+
+    budget_problem = _budget_error(budget)
+    if budget_problem:
+        errors.append(budget_problem)
 
     return {
         "valid": len(errors) == 0,
@@ -216,6 +390,73 @@ def validate(yaml_content: str) -> dict:
         "hints": hints,
         "summary": summary,
     }
+
+
+def _validate_dag_dates_and_schedule(dag_id, dag_cfg, errors, warnings):
+    """Enforce the start_date / end_date / schedule rules VALIDATED_DAG_PARAMS documents.
+
+    None of these were checked before: `start_date: not-a-date`,
+    `end_date` earlier than `start_date`, and `schedule: 'every tuesday-ish'` all
+    returned valid=True, so the definition deployed and then never ran as intended.
+    """
+    parsed = {}
+    for key in ("start_date", "end_date"):
+        raw = dag_cfg.get(key)
+        if raw is None:
+            continue
+        text = raw.strftime("%Y-%m-%d") if isinstance(raw, date) else str(raw)
+        try:
+            parsed[key] = datetime.strptime(text[:10], "%Y-%m-%d").date()
+        except ValueError:
+            errors.append(
+                f"DAG '{dag_id}': {key} must be a YYYY-MM-DD date (got {raw!r})."
+            )
+
+    if "start_date" in parsed and "end_date" in parsed and parsed["end_date"] < parsed["start_date"]:
+        errors.append(
+            f"DAG '{dag_id}': end_date ({parsed['end_date']}) is before start_date "
+            f"({parsed['start_date']}), so no run will ever be scheduled."
+        )
+
+    if "schedule" in dag_cfg:
+        schedule = dag_cfg["schedule"]
+        if schedule is None:
+            return
+        if not isinstance(schedule, str) or not schedule.strip():
+            errors.append(
+                f"DAG '{dag_id}': schedule must be a cron expression, an @preset, or null "
+                f"for on-demand only (got {schedule!r})."
+            )
+            return
+        value = schedule.strip()
+        if value in _SCHEDULE_PRESETS:
+            return
+        if value.startswith("@"):
+            errors.append(
+                f"DAG '{dag_id}': '{value}' is not a valid schedule preset. Use one of "
+                f"{', '.join(sorted(_SCHEDULE_PRESETS))}, a cron expression, or null."
+            )
+            return
+        fields = value.split()
+        if len(fields) != 5:
+            errors.append(
+                f"DAG '{dag_id}': schedule '{value}' is not a 5-field cron expression "
+                f"(minute hour day month weekday) or a supported @preset."
+            )
+            return
+        for field, allowed in zip(fields, _CRON_FIELD_RANGES, strict=True):
+            if not _CRON_FIELD_RE.fullmatch(field):
+                errors.append(
+                    f"DAG '{dag_id}': schedule field '{field}' in '{value}' is not valid cron syntax."
+                )
+                return
+            for part in re.findall(r"\d+", field):
+                low, high = allowed
+                if not low <= int(part) <= high:
+                    warnings.append(
+                        f"DAG '{dag_id}': schedule field '{field}' contains {part}, outside the "
+                        f"valid range {low}-{high}."
+                    )
 
 
 def _validate_dag_level(dag_id, dag_cfg, errors, warnings, hints):
@@ -237,21 +478,17 @@ def _validate_dag_level(dag_id, dag_cfg, errors, warnings, hints):
         elif key in IGNORED_DAG_PARAMS:
             warnings.append(f"DAG '{dag_id}': '{key}' is ignored by MWAA Serverless — remove it.")
         else:
-            warnings.append(f"DAG '{dag_id}': unrecognised DAG-level key '{key}'.")
-
-    mar = dag_cfg.get("max_active_runs")
-    if mar is not None:
-        if not isinstance(mar, int) or isinstance(mar, bool) or mar < 1:
-            errors.append(f"DAG '{dag_id}': max_active_runs must be an integer >= 1.")
-        elif mar > QUOTAS["max_concurrent_runs_per_workflow"]:
+            # An ERROR, not a warning. The service rejects an unrecognised DAG-level key
+            # with the same 'Unexpected element' ValidationException it uses for
+            # task_groups, so reporting it as a warning meant valid=True for a
+            # definition CreateWorkflow will refuse.
             errors.append(
-                f"DAG '{dag_id}': max_active_runs={mar} exceeds the per-workflow limit of "
-                f"{QUOTAS['max_concurrent_runs_per_workflow']}."
+                f"DAG '{dag_id}': unrecognised DAG-level key '{key}'. MWAA Serverless rejects "
+                f"unknown DAG attributes with 'Unexpected element'. Accepted keys are: "
+                f"{', '.join(sorted(ACCEPTED_DAG_KEYS))}."
             )
 
-    mat = dag_cfg.get("max_active_tasks")
-    if mat is not None and (not isinstance(mat, int) or isinstance(mat, bool) or mat < 1):
-        errors.append(f"DAG '{dag_id}': max_active_tasks must be an integer >= 1.")
+    _validate_dag_dates_and_schedule(dag_id, dag_cfg, errors, warnings)
 
     da = dag_cfg.get("default_args")
     if da is not None:
@@ -350,9 +587,11 @@ def _validate_execution_timeout(where, et, errors):
             )
 
 
-def _validate_tasks(dag_id, tasks, errors, warnings, hints, summary):
+def _validate_tasks(dag_id, tasks, errors, warnings, hints, summary, budget=None):
     task_ids = set(tasks.keys())
     dep_graph = {}
+    if budget is None:
+        budget = _NodeBudget()
 
     for tid, tcfg in tasks.items():
         if not _TASK_ID_RE.match(str(tid)):
@@ -369,7 +608,7 @@ def _validate_tasks(dag_id, tasks, errors, warnings, hints, summary):
                 f"{tcfg['task_id']}' disagrees with it and is redundant — remove it."
             )
 
-        short = _validate_operator(dag_id, tid, tcfg, errors, warnings, summary)
+        short = _validate_operator(tid, tcfg, errors, summary)
         _validate_flat_params(tid, tcfg, errors)
         deps = _validate_dependencies(tid, tcfg, task_ids, errors)
         dep_graph[tid] = deps
@@ -377,20 +616,20 @@ def _validate_tasks(dag_id, tasks, errors, warnings, hints, summary):
         _validate_retries(f"Task '{tid}'", tcfg.get("retries"), errors)
         _validate_retry_delay(f"Task '{tid}'", tcfg.get("retry_delay"), errors)
         _validate_execution_timeout(f"Task '{tid}'", tcfg.get("execution_timeout"), errors)
-        _validate_task_extras(tid, tcfg, warnings, hints)
+        _validate_task_extras(tid, tcfg, warnings)
 
         if short:
-            _validate_required_params(tid, short, tcfg, errors, hints)
+            _validate_required_params(tid, short, tcfg, errors)
             _validate_code_operator(tid, short, tcfg, errors, warnings, summary)
             _validate_sensor_cost(tid, short, tcfg, errors, warnings, hints)
             _validate_blocking_wait_cost(tid, short, tcfg, hints)
 
     _validate_cycles(dag_id, dep_graph, errors)
-    _validate_jinja(tasks, dep_graph, task_ids, errors, warnings)
+    _validate_jinja(tasks, dep_graph, task_ids, errors, warnings, budget)
     _validate_graph_shape(dag_id, tasks, dep_graph, hints)
 
 
-def _validate_operator(dag_id, tid, tcfg, errors, warnings, summary):
+def _validate_operator(tid, tcfg, errors, summary):
     op = tcfg.get("operator")
     if not op:
         errors.append(f"Task '{tid}' has no 'operator'.")
@@ -496,7 +735,7 @@ def _validate_dependencies(tid, tcfg, task_ids, errors):
     return deps
 
 
-def _validate_task_extras(tid, tcfg, warnings, hints):
+def _validate_task_extras(tid, tcfg, warnings):
     for attr, note in AWS_BASE_OPERATOR_ATTRS.items():
         if attr in tcfg:
             warnings.append(f"Task '{tid}': '{attr}' — {note} Remove it to keep the definition clean.")
@@ -619,7 +858,7 @@ def _validate_blocking_wait_cost(tid, short, tcfg, hints):
         )
 
 
-def _validate_required_params(tid, short, tcfg, errors, hints):
+def _validate_required_params(tid, short, tcfg, errors):
     required = OPERATOR_REQUIRED_PARAMS.get(short)
     if not required:
         return
@@ -660,60 +899,112 @@ def _validate_code_operator(tid, short, tcfg, errors, warnings, summary):
 
 
 def _validate_cycles(dag_id, dep_graph, errors):
-    """Report dependency cycles (Airflow rejects them; the DAG will not load)."""
+    """Report dependency cycles (Airflow rejects them; the DAG will not load).
+
+    Iterative three-colour DFS. The recursive form raised an uncaught RecursionError
+    on a dependency chain of ~1000 tasks — not a yaml.YAMLError, so validate()'s
+    handler missed it and the tool call crashed instead of returning findings.
+    """
     WHITE, GREY, BLACK = 0, 1, 2
-    colour = {t: WHITE for t in dep_graph}
+    colour = dict.fromkeys(dep_graph, WHITE)
     reported = set()
 
-    def visit(node, stack):
-        colour[node] = GREY
-        for dep in dep_graph.get(node, []):
-            if dep not in colour:
+    for root in list(dep_graph):
+        if colour[root] != WHITE:
+            continue
+        # Explicit stack of (node, iterator over its deps, path-to-node).
+        colour[root] = GREY
+        stack = [(root, iter(dep_graph.get(root, [])), [root])]
+        while stack:
+            node, deps, path = stack[-1]
+            advanced = False
+            for dep in deps:
+                if dep not in colour:
+                    continue
+                if colour[dep] == GREY:
+                    cyc = path[path.index(dep):] + [dep] if dep in path else [dep, node]
+                    key = frozenset(cyc)
+                    if key not in reported:
+                        reported.add(key)
+                        errors.append(
+                            f"DAG '{dag_id}': dependency cycle {' -> '.join(reversed(cyc))}. "
+                            f"Airflow cannot load a cyclic graph."
+                        )
+                elif colour[dep] == WHITE:
+                    colour[dep] = GREY
+                    stack.append((dep, iter(dep_graph.get(dep, [])), path + [dep]))
+                    advanced = True
+                    break
+            if not advanced:
+                colour[node] = BLACK
+                stack.pop()
+
+
+def _upstream_closures(dep_graph):
+    """Transitive upstream closure for every task, computed once.
+
+    Iterative, so a long chain cannot raise RecursionError, and memoised across tasks:
+    the previous per-task recursive helper was recomputed from scratch inside the
+    per-task loop, making the Jinja check O(N^2) on top of its own traversal cost.
+    """
+    closures = {}
+
+    def closure_for(start):
+        if start in closures:
+            return closures[start]
+        # Post-order iterative walk so each node's closure is built from its
+        # already-finished dependencies.
+        order = []
+        seen_on_stack = set()
+        stack = [(start, False)]
+        while stack:
+            node, processed = stack.pop()
+            if processed:
+                order.append(node)
+                seen_on_stack.discard(node)
                 continue
-            if colour[dep] == GREY:
-                cyc = stack[stack.index(dep):] + [dep] if dep in stack else [dep, node]
-                key = frozenset(cyc)
-                if key not in reported:
-                    reported.add(key)
-                    errors.append(
-                        f"DAG '{dag_id}': dependency cycle {' -> '.join(reversed(cyc))}. "
-                        f"Airflow cannot load a cyclic graph."
-                    )
-            elif colour[dep] == WHITE:
-                visit(dep, stack + [dep])
-        colour[node] = BLACK
+            if node in closures or node in seen_on_stack:
+                continue
+            seen_on_stack.add(node)
+            stack.append((node, True))
+            for dep in dep_graph.get(node, []):
+                if dep not in closures and dep not in seen_on_stack:
+                    stack.append((dep, False))
+        for node in order:
+            acc = set()
+            for dep in dep_graph.get(node, []):
+                acc.add(dep)
+                acc |= closures.get(dep, set())
+            closures[node] = acc
+        return closures.get(start, set())
 
-    for t in list(dep_graph):
-        if colour[t] == WHITE:
-            visit(t, [t])
-
-
-def _upstream_closure(task, dep_graph, seen=None):
-    """All transitive upstream task ids of `task`."""
-    if seen is None:
-        seen = set()
-    for dep in dep_graph.get(task, []):
-        if dep not in seen:
-            seen.add(dep)
-            _upstream_closure(dep, dep_graph, seen)
-    return seen
+    for task in dep_graph:
+        closure_for(task)
+    return closures
 
 
-def _validate_jinja(tasks, dep_graph, task_ids, errors, warnings):
+def _validate_jinja(tasks, dep_graph, task_ids, errors, warnings, budget=None):
     """Check Jinja variables and, critically, that every xcom_pull is reachable."""
     seen_unsupported = set()
+    if budget is None:
+        budget = _NodeBudget()
+    # Computed once for the whole DAG rather than per task.
+    closures = _upstream_closures(dep_graph)
 
     for tid, tcfg in tasks.items():
         if not isinstance(tcfg, dict):
             continue
-        upstream = _upstream_closure(tid, dep_graph)
+        upstream = closures.get(tid, set())
 
-        for path, s in _iter_strings(tcfg):
-            if "{{" not in s:
+        for path, s in _iter_strings(tcfg, budget=budget):
+            # Scan both expression ({{ ... }}) and statement ({% ... %}) blocks.
+            # Anchoring only on "{{" skipped every {% if %}/{% for %} entirely, and
+            # capturing only the first identifier after "{{" missed variables used
+            # mid-expression, so "{{ params.x or execution_date }}" reported nothing.
+            if "{{" not in s and "{%" not in s:
                 continue
 
-            for m in _JINJA_VAR_RE.finditer(s):
-                var = m.group(1)
+            for var in _jinja_identifiers(s):
                 root = var.split(".")[0]
                 if root in SUPPORTED_JINJA_VARIABLES or var in SUPPORTED_MACROS:
                     continue
@@ -1044,8 +1335,9 @@ def _repair_task(tid, tcfg, changes, unfixable):
                 f"Task '{tid}': removed the sensor scheduling mode — this task is not a sensor."
             )
 
-    if tcfg.pop("deferrable", None) is not None:
-        changes.append(f"Task '{tid}': removed 'deferrable' (no triggerer in MWAA Serverless).")
+    # NOTE: `deferrable` is already popped earlier in this function, where it is
+    # translated into `mode: reschedule` for sensors. A second pop here could never
+    # fire and its message never appeared.
 
     _repair_durations(tcfg, f"Task '{tid}'", changes)
 
@@ -1056,8 +1348,11 @@ def _repair_durations(cfg, where, changes):
     if rd is not None and not isinstance(rd, dict):
         secs = _duration_to_seconds(rd)
         if secs is None:
+            # Includes bools, which _duration_to_seconds rejects — so the
+            # `isinstance(rd, bool)` test that used to sit on the next branch could
+            # never fire.
             pass
-        elif not isinstance(rd, int) or isinstance(rd, bool):
+        elif not isinstance(rd, int):
             capped = min(secs, QUOTAS["max_retry_delay_seconds"])
             cfg["retry_delay"] = capped
             note = f" (capped at {capped}s)" if capped != secs else ""
