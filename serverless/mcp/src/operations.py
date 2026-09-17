@@ -52,6 +52,12 @@ _MAX_INLINE_CODE_BYTES = int((_LAMBDA_SYNC_PAYLOAD - 256 * 1024) * 3 / 4)
 # tests/test_security.py asserts the two stay in step.
 _PREFLIGHT_NAME_PREFIX = "preflight-"
 
+# How many runs a scanning tool will walk per workflow. Each run inspected costs extra
+# API calls (run detail, log streams), so these tools are bounded rather than complete.
+# Every result built with this cap carries a truncation flag: a bound nobody can see is
+# indistinguishable from "there was nothing there".
+_MAX_RUNS_SCANNED = 200
+
 
 def _configured_bucket_owner():
     """Account id the deployment says must own the target bucket.
@@ -114,6 +120,63 @@ def _client_error_message(exc) -> str:
     )
 
 
+def _boto_config():
+    """Explicit timeout and retry budget for every client this module creates.
+
+    Without this, botocore defaults apply: a 60-second read timeout with retries on
+    top. Inside a 120-second Lambda that is enough for one hung call to consume the
+    whole invocation and be killed mid-flight, returning nothing — the caller sees a
+    transport error rather than a status. Bounding the per-call budget means a slow
+    dependency degrades into a reported timeout instead of a dead invocation.
+
+    Adaptive retry mode also respects the service's throttling signals rather than
+    hammering through them, which matters when several tools poll at once.
+    """
+    from botocore.config import Config
+
+    return Config(
+        connect_timeout=5,
+        read_timeout=20,
+        retries={"max_attempts": 3, "mode": "adaptive"},
+    )
+
+
+def _remaining_seconds(default):
+    """Seconds left in this Lambda invocation, or `default` when not in Lambda.
+
+    The poll budget used to be a constant chosen to sit under the configured Lambda
+    timeout, which is a guess in two ways: it does not know how much of the invocation
+    is already spent, and it goes stale the moment Timeout changes in template.yaml.
+    The runtime knows the real answer, so ask it.
+    """
+    ctx = _LAMBDA_CONTEXT.get("context")
+    if ctx is None or not hasattr(ctx, "get_remaining_time_in_millis"):
+        return default
+    try:
+        # Leave headroom for serialising the response and for the error path; a budget
+        # that consumes every remaining millisecond still gets killed.
+        remaining = ctx.get_remaining_time_in_millis() / 1000.0
+        return max(5, remaining - _RESPONSE_HEADROOM_SECONDS)
+    except Exception:  # noqa: BLE001 - a broken context must not break polling
+        return default
+
+
+# Set by the Lambda handler so operations can see the real deadline. A module global
+# rather than a parameter threaded through a dozen signatures, because only the poll
+# loops need it and Lambda gives one invocation at a time per container.
+_LAMBDA_CONTEXT = {}
+_RESPONSE_HEADROOM_SECONDS = 10
+
+
+def set_lambda_context(context):
+    """Record the current invocation's context. Called by the Lambda handler.
+
+    Local stdio mode never calls this, so _remaining_seconds falls back to the
+    configured budget — correct, because a local process has no invocation deadline.
+    """
+    _LAMBDA_CONTEXT["context"] = context
+
+
 def _get_client():
     """Cached boto3 client for MWAA Serverless.
 
@@ -123,7 +186,7 @@ def _get_client():
     global _client
     if _client is None:
         try:
-            _client = boto3.client("mwaa-serverless")
+            _client = boto3.client("mwaa-serverless", config=_boto_config())
         except Exception as e:  # UnknownServiceError on older botocore
             raise RuntimeError(_client_error_message(e)) from e
     return _client
@@ -160,7 +223,7 @@ def _parse_task_instance(entry):
 def _new_client():
     """A fresh client for use inside a thread (boto3 clients are not thread-safe)."""
     try:
-        return boto3.client("mwaa-serverless")
+        return boto3.client("mwaa-serverless", config=_boto_config())
     except Exception as e:
         raise RuntimeError(_client_error_message(e)) from e
 
@@ -171,7 +234,7 @@ def _failed_tasks_in_run(workflow_arn: str, run_id: str, limit: int = 20) -> lis
     Cheap variant of verify_run_tasks used when scanning many runs: it only looks
     for the authoritative 'Task finished' marker and the first exception value.
     """
-    logs_client = boto3.client("logs")
+    logs_client = boto3.client("logs", config=_boto_config())
     wf_id = workflow_arn.rsplit("/", 1)[-1] if "/" in workflow_arn else workflow_arn
     log_group = _log_group_for(workflow_arn)
     out = []
@@ -226,6 +289,48 @@ def _log_group_for(workflow_arn: str) -> str:
     """
     wf_id = workflow_arn.rsplit("/", 1)[-1] if "/" in workflow_arn else workflow_arn
     return f"/aws/mwaa-serverless/{wf_id}/"
+
+
+def _list_all_pages(client, operation, result_key, cap=None, **kwargs):
+    """Follow pagination on any list API, returning (items, truncated).
+
+    Only list_workflows was paginated. Runs and versions were read one page at a time
+    in ten places, so any judgement built on that history — the latest run, whether a
+    workflow has ever failed, whether it is idle enough to delete — silently used a
+    prefix of the truth.
+
+    `cap` bounds the walk for callers that only need recent history. When it stops
+    early, `truncated` is True so the caller can say so rather than presenting a
+    partial answer as complete. A safety cap that is invisible in the result is how a
+    partial scan becomes a false negative.
+    """
+    items = []
+    token = None
+    truncated = False
+    while True:
+        call = dict(kwargs)
+        if token:
+            call["NextToken"] = token
+        resp = getattr(client, operation)(**call)
+        items.extend(resp.get(result_key) or [])
+        token = resp.get("NextToken")
+        if cap is not None and len(items) >= cap:
+            truncated = bool(token)
+            return items[:cap], truncated
+        if not token:
+            return items, truncated
+
+
+def _list_runs(client, arn, cap=None):
+    """Every run of a workflow, newest first, following pagination."""
+    runs, truncated = _list_all_pages(
+        client, "list_workflow_runs", "WorkflowRuns", cap=cap, WorkflowArn=arn
+    )
+    runs.sort(
+        key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", "")),
+        reverse=True,
+    )
+    return runs, truncated
 
 
 def _list_all_workflows(client=None) -> list:
@@ -395,7 +500,7 @@ def get_workflow(workflow_name: str) -> dict:
         info["definition_source"] = "GetWorkflow.WorkflowDefinition (immutable snapshot)"
     elif s3_loc:
         try:
-            s3 = boto3.client("s3")
+            s3 = boto3.client("s3", config=_boto_config())
             obj = s3.get_object(Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
             yaml_content = obj["Body"].read().decode("utf-8")
             info["definition_source"] = "S3 object (may differ from the deployed snapshot)"
@@ -485,7 +590,7 @@ def _sort_runs_newest_first(runs):
 def _latest_run_id(client, arn, statuses=None):
     """(run_id, error). Newest run, optionally restricted to certain statuses."""
     try:
-        runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+        runs, _ = _list_runs(client, arn)
     except Exception as e:  # noqa: BLE001 - surfaced to the caller
         log.warning("list_workflow_runs failed for %s: %s", arn, e)
         return None, f"Failed to list runs: {e}"
@@ -621,7 +726,7 @@ def find_workflows_using_service(service_keyword: str) -> dict:
                 s3_loc = detail.get("DefinitionS3Location", {})
                 if not s3_loc:
                     return None, None
-                obj = boto3.client("s3").get_object(
+                obj = boto3.client("s3", config=_boto_config()).get_object(
                     Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
                 text = obj["Body"].read().decode("utf-8")
             dag = yaml.safe_load(text)
@@ -671,7 +776,7 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
     parameter, not part of the YAML.
     """
     client = _get_client()
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", config=_boto_config())
 
     if not s3_key:
         s3_key = f"workflows/{workflow_name}.yaml"
@@ -859,7 +964,7 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
         return out
 
     client = _get_client()
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", config=_boto_config())
     probe = f"{_PREFLIGHT_NAME_PREFIX}{uuid.uuid4().hex[:8]}"
     key = f"preflight/{probe}.yaml"
     ckey = None
@@ -981,8 +1086,19 @@ def poll_workflow_run(workflow_name: str, run_id: str = "", max_seconds: int = 0
     # status rather than being killed mid-poll. The Function URL transport allows a
     # far longer request than API Gateway's old 29s cap, so a single call can now
     # wait out most task transitions instead of forcing the client to re-poll.
+    #
+    # The ceiling comes from the RUNTIME, not from a constant: max_poll_seconds was
+    # chosen to sit under a 120s Timeout, which is a guess that ignores time already
+    # spent in this invocation and goes stale if Timeout changes. Asking the context
+    # for the time actually remaining is both correct and self-maintaining. Locally
+    # there is no invocation deadline, so the configured value stands.
     _default_poll, _max_poll = _poll_limits()
     budget = max(5, min(int(max_seconds or _default_poll), _max_poll))
+    deadline_budget = _remaining_seconds(budget)
+    if deadline_budget < budget:
+        log.info("Poll budget trimmed from %ss to %.0fs by the invocation deadline",
+                 budget, deadline_budget)
+        budget = int(deadline_budget)
 
     arn, name, _ = _resolve_workflow_arn(workflow_name)
     if arn is None:
@@ -991,13 +1107,9 @@ def poll_workflow_run(workflow_name: str, run_id: str = "", max_seconds: int = 0
     # Resolve run_id if not provided
     if not run_id:
         try:
-            runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+            runs, _ = _list_runs(client, arn)
             if not runs:
                 return {"workflow_name": name, "message": "No runs found"}
-            runs.sort(
-                key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", "")),
-                reverse=True,
-            )
             run_id = runs[0].get("RunId", "")
         except Exception as e:
             return {"error": f"Failed to list runs: {str(e)}"}
@@ -1110,10 +1222,9 @@ def verify_run_tasks(workflow_name: str, run_id: str = "", include_logs: bool = 
 
     if not run_id:
         try:
-            runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+            runs, _ = _list_runs(client, arn)
             if not runs:
                 return {"error": f"No runs found for '{name}'"}
-            runs.sort(key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", "")), reverse=True)
             run_id = runs[0].get("RunId", "")
         except Exception as e:
             return {"error": f"Failed to list runs: {str(e)}"}
@@ -1194,7 +1305,7 @@ def _read_task_outcomes(arn, run_id, declared_tasks, include_logs, max_error_lin
                         silent_tasks=frozenset()):
     """One pass over a run's task log streams. Returns the outcome dict, or
     {"reason": ...} when the log group does not exist yet."""
-    logs_client = boto3.client("logs")
+    logs_client = boto3.client("logs", config=_boto_config())
     log_group = _log_group_for(arn)
     prefix = f"workflow_id={arn.rsplit('/', 1)[-1]}/run_id={run_id}/"
 
@@ -1305,7 +1416,7 @@ def _read_task_outcomes(arn, run_id, declared_tasks, include_logs, max_error_lin
 
 def _get_task_error_logs(workflow_arn: str, run_id: str, max_lines: int = 5) -> list:
     """Pull error/warning log lines from CloudWatch for a failed run's tasks."""
-    logs_client = boto3.client("logs")
+    logs_client = boto3.client("logs", config=_boto_config())
     wf_id = workflow_arn.rsplit("/", 1)[-1] if "/" in workflow_arn else workflow_arn
     log_group = _log_group_for(workflow_arn)
 
@@ -1394,7 +1505,11 @@ def get_failed_runs_summary(name_contains: str = "", hours_back: int = 24, analy
         try:
             wf_client = _new_client()
             arn = wf["WorkflowArn"]
-            runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+            # Bounded: each FAILED run here costs a get_workflow_run plus log reads, so
+            # an unbounded walk of a busy workflow would not finish. The bound is
+            # reported (see runs_truncated below) rather than left invisible — a silent
+            # cap turns "no failures found" into a false negative.
+            runs, runs_truncated = _list_runs(wf_client, arn, cap=_MAX_RUNS_SCANNED)
             failures = []
             hidden = []
             for r in runs:
@@ -1450,6 +1565,12 @@ def get_failed_runs_summary(name_contains: str = "", hours_back: int = 24, analy
                 out["failed_runs"] = failures
             if hidden:
                 out["runs_reporting_success_with_failed_tasks"] = hidden
+            if runs_truncated:
+                out["history_truncated"] = (
+                    f"Only the most recent {_MAX_RUNS_SCANNED} runs were scanned, so older "
+                    f"failures may exist. This is not a clean bill of health for the whole "
+                    f"history."
+                )
             if out:
                 return {"name": wf.get("Name", ""), "arn": arn, **out}, None
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
@@ -1552,6 +1673,16 @@ def _analyse_with_bedrock(prompt: str, max_tokens: int = None):
 
     try:
         kwargs = {"region_name": region} if region else {}
+        # Model inference is slow by nature, so this client gets a longer read timeout
+        # than the 20s the AWS control-plane calls use. Retries stay bounded: a retry
+        # storm against Bedrock costs money as well as time.
+        from botocore.config import Config
+
+        kwargs["config"] = Config(
+            connect_timeout=5,
+            read_timeout=60,
+            retries={"max_attempts": 2, "mode": "standard"},
+        )
         bedrock = boto3.client("bedrock-runtime", **kwargs)
     except Exception as e:
         return None, None, f"Could not create a bedrock-runtime client: {e}"
@@ -1631,7 +1762,15 @@ def delete_workflows(name_contains: str = "", not_run_in_days: int = 0, dry_run:
             arn = wf["WorkflowArn"]
             try:
                 wf_client = _new_client()
-                runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+                # EVERY page. This decides whether a workflow gets deleted, and a single
+                # page of history could easily omit the newest run — which would make a
+                # workflow that ran yesterday look untouched for months.
+                runs, truncated = _list_runs(wf_client, arn)
+                if truncated:
+                    return None, (
+                        f"{wf.get('Name', arn)}: run history was truncated, so the last-run "
+                        f"time cannot be established"
+                    )
                 if not runs:
                     # Never run — include it
                     return wf, None
@@ -1721,7 +1860,7 @@ def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) ->
         arn = wf.get("WorkflowArn", "")
         try:
             wf_client = _new_client()
-            runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+            runs, runs_truncated = _list_runs(wf_client, arn, cap=_MAX_RUNS_SCANNED)
             matched = []
             for r in runs:
                 summary = r.get("RunDetailSummary", {})
@@ -1745,7 +1884,12 @@ def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) ->
                     "ended": str(summary.get("EndedAt", "")),
                 })
             if matched:
-                return {"name": wf.get("Name", ""), "runs": matched}, None
+                entry = {"name": wf.get("Name", ""), "runs": matched}
+                if runs_truncated:
+                    entry["history_truncated"] = (
+                        f"Only the most recent {_MAX_RUNS_SCANNED} runs were examined."
+                    )
+                return entry, None
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
             log.warning("Could not list runs for %s: %s", wf.get("Name", arn), e)
             return None, f"{wf.get('Name', arn)}: {e}"
@@ -1812,7 +1956,7 @@ def get_workflow_summary(workflow_name: str) -> dict:
         info["definition_s3"] = f"s3://{s3_loc.get('Bucket','')}/{s3_loc.get('ObjectKey','')}"
     if not text and s3_loc:
         try:
-            obj = boto3.client("s3").get_object(
+            obj = boto3.client("s3", config=_boto_config()).get_object(
                 Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
             text = obj["Body"].read().decode("utf-8")
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
@@ -1834,9 +1978,8 @@ def get_workflow_summary(workflow_name: str) -> dict:
 
     # Get latest run status
     try:
-        runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+        runs, _ = _list_runs(client, arn)
         if runs:
-            runs = _sort_runs_newest_first(runs)
             latest = runs[0]
             summary = latest.get("RunDetailSummary", {})
             info["latest_run"] = {
@@ -1874,9 +2017,9 @@ def bulk_status(name_contains: str = "", names: list = None) -> dict:
         try:
             wf_client = _new_client()
             info = {"name": wf.get("Name", ""), "workflow_status": wf.get("WorkflowStatus", "")}
-            runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+            runs, _ = _list_runs(wf_client, arn)
             if runs:
-                s = _sort_runs_newest_first(runs)[0].get("RunDetailSummary", {})
+                s = runs[0].get("RunDetailSummary", {})
                 info["latest_run"] = {
                     "status": s.get("Status", ""),
                     "created": str(s.get("CreatedOn", "")),
@@ -1943,7 +2086,7 @@ def redeploy_workflow(workflow_name: str, yaml_content: str, s3_bucket: str = ""
         return {"error": "Could not determine S3 location. Provide s3_bucket and s3_key."}
 
     # Upload new YAML
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", config=_boto_config())
     try:
         _put_object(s3, s3_bucket, s3_key, yaml_content.encode("utf-8"), expected_bucket_owner)
     except Exception as e:  # noqa: BLE001 - surfaced to the caller
@@ -1984,7 +2127,9 @@ def compare_versions(workflow_name: str) -> dict:
     if arn is None:
         return {"error": name}
 
-    versions = client.list_workflow_versions(WorkflowArn=arn).get("WorkflowVersions", [])
+    versions, _ = _list_all_pages(
+        client, "list_workflow_versions", "WorkflowVersions", WorkflowArn=arn
+    )
     if len(versions) < 2:
         return {"workflow_name": name, "message": "Only one version exists, nothing to compare."}
 
@@ -1993,7 +2138,7 @@ def compare_versions(workflow_name: str) -> dict:
     latest = versions[0]
     previous = versions[1]
 
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", config=_boto_config())
     yamls = {}
     for label, ver in [("latest", latest), ("previous", previous)]:
         s3_loc = ver.get("DefinitionS3Location", {})

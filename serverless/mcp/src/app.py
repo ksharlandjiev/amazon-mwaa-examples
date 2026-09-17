@@ -13,6 +13,7 @@ from awslabs.mcp_lambda_handler import MCPLambdaHandler
 import builder as _builder
 import codebundle as _codebundle
 import config as _config
+import operations as _operations
 from tools import (
     generate_yaml, validate_yaml, repair_yaml, list_operators,
     get_constraints, get_overview, get_dag_yaml_spec as _get_dag_yaml_spec,
@@ -857,6 +858,10 @@ def mwaa_delete_workflows(name_contains: str = "", not_run_in_days: int = 0,
 
 
 def handler(event, context):
+    # Hand the Lambda context to operations so the poll loops can derive their deadline
+    # from the time actually remaining, rather than from a constant chosen to sit under
+    # whatever Timeout happens to be in template.yaml.
+    _operations.set_lambda_context(context)
     return mcp_server.handle_request(event, context)
 
 

@@ -1285,3 +1285,155 @@ def test_bucket_owner_falls_back_to_the_argument_when_unconfigured(monkeypatch):
     monkeypatch.delenv("EXPECTED_BUCKET_OWNER", raising=False)
     operations._put_object(S3(), "b", "k", b"body", expected_bucket_owner="999999999999")
     assert captured["ExpectedBucketOwner"] == "999999999999"
+
+
+
+# --- pagination, SDK budgets and deadlines ----------------------------------
+# Only list_workflows was paginated. Run and version history was read one page at a
+# time in ten places, so anything built on that history used a prefix of the truth.
+
+
+class _PagedClient:
+    """A client whose list_workflow_runs really does paginate."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def list_workflow_runs(self, **kwargs):
+        self.calls.append(kwargs)
+        index = 0 if not kwargs.get("NextToken") else int(kwargs["NextToken"])
+        page = self.pages[index]
+        resp = {"WorkflowRuns": page}
+        if index + 1 < len(self.pages):
+            resp["NextToken"] = str(index + 1)
+        return resp
+
+    def list_workflow_versions(self, **kwargs):
+        index = 0 if not kwargs.get("NextToken") else int(kwargs["NextToken"])
+        resp = {"WorkflowVersions": self.pages[index]}
+        if index + 1 < len(self.pages):
+            resp["NextToken"] = str(index + 1)
+        return resp
+
+
+def _run(run_id, created):
+    return {"RunId": run_id, "RunDetailSummary": {"CreatedOn": created, "Status": "SUCCESS"}}
+
+
+def test_run_history_follows_every_page():
+    client = _PagedClient([
+        [_run("r1", "2026-01-01T00:00:00Z")],
+        [_run("r2", "2026-02-01T00:00:00Z")],
+        [_run("r3", "2026-03-01T00:00:00Z")],
+    ])
+    runs, truncated = operations._list_runs(client, "arn:aws:x:::workflow/w")
+    assert [r["RunId"] for r in runs] == ["r3", "r2", "r1"], "newest first, all pages"
+    assert truncated is False
+    assert len(client.calls) == 3
+
+
+def test_the_newest_run_is_found_even_when_it_is_on_a_later_page():
+    """This is the bug the single-page read caused: whichever page the newest run landed
+    on decided whether it was seen at all."""
+    client = _PagedClient([
+        [_run("old", "2026-01-01T00:00:00Z")],
+        [_run("newest", "2026-12-01T00:00:00Z")],
+    ])
+    runs, _ = operations._list_runs(client, "arn:aws:x:::workflow/w")
+    assert runs[0]["RunId"] == "newest"
+
+
+def test_a_capped_scan_says_that_it_was_capped():
+    """A safety bound nobody can see is indistinguishable from an empty result."""
+    client = _PagedClient([[_run(f"r{i}", "2026-01-01T00:00:00Z")] for i in range(5)])
+    runs, truncated = operations._list_runs(client, "arn:aws:x:::workflow/w", cap=3)
+    assert len(runs) == 3
+    assert truncated is True
+
+
+def test_an_exhausted_scan_is_not_reported_as_truncated():
+    client = _PagedClient([[_run("r1", "2026-01-01T00:00:00Z")]])
+    _, truncated = operations._list_runs(client, "arn:aws:x:::workflow/w", cap=99)
+    assert truncated is False
+
+
+def test_versions_paginate_too():
+    client = _PagedClient([[{"VersionId": "1"}], [{"VersionId": "2"}]])
+    versions, _ = operations._list_all_pages(
+        client, "list_workflow_versions", "WorkflowVersions",
+        WorkflowArn="arn:aws:x:::workflow/w",
+    )
+    assert [v["VersionId"] for v in versions] == ["1", "2"]
+
+
+def test_every_client_carries_an_explicit_timeout_and_retry_budget():
+    """Botocore's defaults are a 60s read timeout plus retries. Inside a 120s Lambda one
+    hung call can consume the whole invocation and be killed, returning nothing."""
+    config = operations._boto_config()
+    assert config.connect_timeout == 5
+    assert config.read_timeout == 20
+    assert config.retries["max_attempts"] == 3
+    assert config.retries["mode"] == "adaptive"
+
+    source = (REPO_ROOT / "src" / "operations.py").read_text()
+    # Every client in this module must be constructed with a config. bedrock-runtime is
+    # the one exception and builds its own (longer) budget inline.
+    for line in source.splitlines():
+        if "boto3.client(" in line and "bedrock-runtime" not in line:
+            assert "_boto_config()" in line, f"unbudgeted client: {line.strip()}"
+
+
+def test_the_poll_budget_comes_from_the_invocation_deadline(monkeypatch):
+    """A constant chosen to sit under Timeout ignores time already spent and goes stale
+    when Timeout changes. The runtime knows the real answer."""
+    class Context:
+        def __init__(self, ms):
+            self.ms = ms
+
+        def get_remaining_time_in_millis(self):
+            return self.ms
+
+    operations.set_lambda_context(Context(30_000))
+    try:
+        # 30s left, minus headroom for serialising the response.
+        assert operations._remaining_seconds(110) == 30 - operations._RESPONSE_HEADROOM_SECONDS
+        # Never negative, never zero.
+        operations.set_lambda_context(Context(1_000))
+        assert operations._remaining_seconds(110) >= 5
+    finally:
+        operations.set_lambda_context(None)
+
+
+def test_without_a_lambda_context_the_configured_budget_stands():
+    """Local stdio has no invocation deadline, so nothing should be trimmed."""
+    operations.set_lambda_context(None)
+    assert operations._remaining_seconds(90) == 90
+
+
+def test_a_broken_context_does_not_break_polling():
+    class Hostile:
+        def get_remaining_time_in_millis(self):
+            raise RuntimeError("no")
+
+    operations.set_lambda_context(Hostile())
+    try:
+        assert operations._remaining_seconds(90) == 90
+    finally:
+        operations.set_lambda_context(None)
+
+
+def test_the_handler_hands_the_context_to_operations():
+    """The deadline logic is inert unless the handler wires it up."""
+    source = (REPO_ROOT / "src" / "app.py").read_text()
+    handler = source.split("def handler(event, context):", 1)[1].split("\n\n", 1)[0]
+    assert "set_lambda_context(context)" in handler, handler
+
+
+def test_deleting_by_inactivity_refuses_to_decide_on_truncated_history(monkeypatch):
+    """This path chooses what to DELETE. A partial history could make a workflow that
+    ran yesterday look untouched for months."""
+    source = (REPO_ROOT / "src" / "operations.py").read_text()
+    check = source.split("def _check_inactive(wf):", 1)[1].split("return None, None", 1)[0]
+    assert "_list_runs(" in check, "the inactivity check must paginate"
+    assert "truncated" in check, "and must refuse to decide when history is incomplete"
