@@ -9,6 +9,7 @@ that destructive calls were NOT made.
 
 import json
 import re
+import uuid
 from pathlib import Path
 
 import pytest
@@ -61,16 +62,126 @@ def _policy_for(service="glue", **kwargs):
 
 
 @pytest.mark.parametrize("service", ALL_DEMO_SERVICES)
-def test_generated_policy_never_uses_resource_wildcard(service):
-    """A Resource "*" policy plus a copy-paste CLI command is the single most
-    dangerous thing this sample could ship."""
+def test_generated_policy_wildcards_only_where_iam_demands_them(service):
+    """A Resource "*" policy plus a copy-paste CLI command is the single most dangerous
+    thing this sample could ship — but a blanket ban is what shipped the bug. IAM
+    defines no resource type for a handful of actions, so an ARN DENIES them at run
+    time while every local check passes.
+
+    So the rule is not "never *", it is "* only for actions IAM will not scope, and
+    never for anything destructive".
+    """
     result = _policy_for(service, account_id="123456789012", region="us-east-1")
     for statement in result["permissions_policy"]["Statement"]:
         resource = statement["Resource"]
         resources = resource if isinstance(resource, list) else [resource]
-        assert "*" not in resources, f"{statement['Sid']} in {service} uses Resource: '*'"
-        for arn in resources:
-            assert arn.startswith("arn:"), f"{statement['Sid']}: {arn!r} is not an ARN"
+        actions = statement["Action"]
+        actions = actions if isinstance(actions, list) else [actions]
+
+        if "*" in resources:
+            assert resources == ["*"], \
+                f"{statement['Sid']}: mixing '*' with ARNs hides which action needs it"
+            unexpected = [a for a in actions if a not in tools._WILDCARD_ONLY_ACTIONS]
+            assert not unexpected, (
+                f"{statement['Sid']} in {service} uses Resource '*' for {unexpected}, "
+                f"which are not in _WILDCARD_ONLY_ACTIONS. Either IAM really refuses to "
+                f"scope them — add them there with a justification — or this is an "
+                f"over-grant."
+            )
+            destructive = [a for a in actions
+                           if a.split(":", 1)[-1].startswith(tools._DESTRUCTIVE_ACTION_VERBS)]
+            assert not destructive, \
+                f"{statement['Sid']}: {destructive} must never be granted on Resource '*'"
+        else:
+            for arn in resources:
+                assert arn.startswith("arn:"), f"{statement['Sid']}: {arn!r} is not an ARN"
+            scoped_but_unscopable = [a for a in actions if a in tools._WILDCARD_ONLY_ACTIONS]
+            assert not scoped_but_unscopable, (
+                f"{statement['Sid']} in {service} scopes {scoped_but_unscopable} to an ARN. "
+                f"IAM will evaluate that as implicitDeny at run time — the exact defect "
+                f"this sample hit in its own Lambda policy."
+            )
+
+
+@pytest.mark.parametrize("service", ALL_DEMO_SERVICES)
+def test_generated_policy_withholds_destruction_by_default(service):
+    """A generated role must not be able to delete or terminate anything until the
+    caller explicitly opts in."""
+    result = _policy_for(service, account_id="123456789012", region="us-east-1")
+    granted = [
+        action
+        for statement in result["permissions_policy"]["Statement"]
+        for action in (statement["Action"] if isinstance(statement["Action"], list)
+                       else [statement["Action"]])
+    ]
+    destructive = [a for a in granted
+                   if a.split(":", 1)[-1].startswith(tools._DESTRUCTIVE_ACTION_VERBS)]
+    assert not destructive, (
+        f"the {service} role grants {destructive} by default; "
+        f"include_destructive_actions must default to False"
+    )
+    assert result["destructive_actions_granted"] is None
+
+
+def test_destructive_actions_are_reported_when_withheld():
+    """Withholding silently would make a DAG fail with AccessDenied and no explanation
+    of why. The caller has to be told what was left out and how to get it."""
+    result = _policy_for("s3", account_id="123456789012", region="us-east-1")
+    withheld = result["destructive_actions_withheld"]
+    assert withheld, "the s3 demo deletes objects, so something must be withheld"
+    assert any("include_destructive_actions" in note for note in result["how_to_scope_down"]), \
+        "how_to_scope_down must say how to opt in"
+
+
+def test_opting_in_puts_destruction_in_its_own_scoped_statement():
+    result = _policy_for("s3", account_id="123456789012", region="us-east-1",
+                         include_destructive_actions=True)
+    sids = [s["Sid"] for s in result["permissions_policy"]["Statement"]]
+    assert any(sid.startswith("Destructive") for sid in sids), sids
+    for statement in result["permissions_policy"]["Statement"]:
+        if statement["Sid"].startswith("Destructive"):
+            resource = statement["Resource"]
+            resources = resource if isinstance(resource, list) else [resource]
+            assert "*" not in resources, "destruction must never be granted account-wide"
+
+
+def test_unscopable_actions_are_isolated_not_merged():
+    """The whole point of the split: one statement cannot express a per-action rule.
+    The ec2 demo mixes DescribeInstances (no resource type) with StartInstances
+    (instance ARNs), so it must produce two statements, not one compromise."""
+    result = _policy_for("ec2", account_id="123456789012", region="us-east-1")
+    ec2_statements = {
+        s["Sid"]: s for s in result["permissions_policy"]["Statement"]
+        if "ec2" in str(s["Action"])
+    }
+    scoped = [s for sid, s in ec2_statements.items() if not sid.endswith("Unscopable")]
+    unscoped = [s for sid, s in ec2_statements.items() if sid.endswith("Unscopable")]
+    assert scoped and unscoped, f"expected both kinds, got {list(ec2_statements)}"
+
+    unscoped_actions = set()
+    for s in unscoped:
+        unscoped_actions.update(s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+    assert "ec2:DescribeInstances" in unscoped_actions
+    assert "ec2:DescribeInstanceStatus" in unscoped_actions
+
+    scoped_actions = set()
+    for s in scoped:
+        scoped_actions.update(s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+    assert "ec2:StartInstances" in scoped_actions
+    assert not scoped_actions & tools._WILDCARD_ONLY_ACTIONS
+
+
+def test_wildcard_only_set_is_justified_and_never_destructive():
+    """Every entry widens a policy, so the set must stay small, deliberate, and free of
+    anything that can destroy a resource."""
+    for action in tools._WILDCARD_ONLY_ACTIONS:
+        assert ":" in action, f"{action!r} is not a qualified IAM action"
+        verb = action.split(":", 1)[1]
+        assert not verb.startswith(tools._DESTRUCTIVE_ACTION_VERBS), \
+            f"{action} is destructive and must never be granted on Resource '*'"
+    source = (REPO_ROOT / "src" / "tools.py").read_text()
+    assert "iam:SimulateCustomPolicy" in source, \
+        "the set must point at how it was verified against live IAM"
 
 
 def test_passrole_to_cloudformation_is_withheld_without_named_roles():
@@ -128,7 +239,8 @@ def test_placeholder_policy_cannot_be_pasted_as_a_one_liner():
 
 
 def test_destructive_actions_are_isolated_in_their_own_statement():
-    result = _policy_for("s3", account_id="123456789012", region="us-east-1")
+    result = _policy_for("s3", account_id="123456789012", region="us-east-1",
+                         include_destructive_actions=True)
     destructive_sids = [s["Sid"] for s in result["permissions_policy"]["Statement"]
                         if s["Sid"].startswith("Destructive")]
     assert destructive_sids
@@ -355,10 +467,58 @@ def test_attempt_ordering_is_numeric():
 
 
 def test_oversized_code_bundle_is_rejected_before_decoding(stubbed):
-    huge = "A" * (operations._MAX_CODE_ZIP_BYTES * 4 // 3 + 8)
-    result = operations.deploy_and_run("wf", "d:\n  tasks: {}\n", "bucket", "role", 
+    """The guard is on the ENCODED length, so an oversized payload is refused without
+    ever being expanded into memory.
+
+    The definition has to be VALID for this to prove anything: deploy_and_run validates
+    locally before it looks at anything else, so an invalid one returns a validation
+    error and the size guard is never reached.
+    """
+    huge = "A" * (operations._MAX_INLINE_CODE_BYTES * 4 // 3 + 8)
+    result = operations.deploy_and_run("wf", _MINIMAL_DAG, "bucket", "role",
                                        code_zip_base64=huge)
     assert "error" in result
+    assert "decodes to more than" in result["error"], result
+
+
+def test_the_inline_bundle_limit_is_the_transport_not_the_service_quota(stubbed):
+    """MWAA accepts 250 MB. A Lambda request carries 6 MB. Enforcing the service quota
+    on an inline bundle means the caller hits a transport failure instead of an error
+    that says what to do, somewhere around 4 MB.
+    """
+    assert operations._MAX_INLINE_CODE_BYTES < operations._MWAA_MAX_CODE_BYTES
+
+    # Legal for MWAA, impossible through the Function URL.
+    between = "A" * (operations._MAX_INLINE_CODE_BYTES * 4 // 3 + 1024)
+    result = operations.deploy_and_run("wf", _MINIMAL_DAG, "bucket", "role",
+                                       code_zip_base64=between)
+    assert "error" in result
+    assert "INLINE" in result["error"], result
+    assert "250 MB" in result["error"], "say what the service limit really is"
+    assert "code_s3_key" in result["fix"], "the error must name the way out"
+
+
+def test_both_modules_agree_on_the_inline_ceiling():
+    """codebundle warns at the ceiling and operations enforces it. If they drift, the
+    builder hands back a bundle the deployer then refuses."""
+    import codebundle
+
+    assert codebundle._MAX_INLINE_BUNDLE_BYTES == operations._MAX_INLINE_CODE_BYTES
+    assert codebundle._MWAA_MAX_CODE_BYTES == operations._MWAA_MAX_CODE_BYTES
+
+
+def test_build_code_bundle_reports_all_three_limits():
+    """A caller cannot reason about "the limit" without being told which one applies."""
+    import codebundle
+
+    result = codebundle.build_code_bundle({"m.py": "def f(**c):\n    return 1\n"})
+    limits = result["size_limits"]
+    assert limits["max_inline_bytes"] < limits["mwaa_service_quota_bytes"]
+    assert limits["this_bundle_bytes"] == result["size_bytes"]
+    assert "6 MB" in limits["max_inline_note"]
+    assert "stdio" in limits["max_inline_note"], "local mode has no transport limit"
+    # A small bundle must not be warned about.
+    assert "transport_warning" not in result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -763,3 +923,288 @@ def test_ci_workflow_is_scoped_to_this_sample_and_needs_no_credentials():
     body = workflow.read_text()
     for forbidden in ("aws-actions/configure-aws-credentials", "id-token", "secrets."):
         assert forbidden not in body, f"CI must not use {forbidden!r}"
+
+
+
+def test_withholding_destruction_names_the_teardown_tasks_it_breaks():
+    """Defaulting destruction off is right, but doing it silently to a DAG that tears
+    down its own resources just relocates the damage: the delete task is denied and the
+    resources it should have removed keep billing. The caller has to be told which
+    tasks, by name."""
+    result = _policy_for("ec2", account_id="123456789012", region="us-east-1")
+    affected = result["teardown_tasks_affected"]
+    assert affected, "the ec2 demo deletes the stack it creates"
+    assert "delete_ec2_stack" in affected, affected
+
+    note = next(n for n in result["how_to_scope_down"] if "WITHHELD" in n)
+    for task in affected:
+        assert task in note, f"{task} is not named in the guidance"
+    assert "still billing" in note
+
+
+def test_opting_in_reports_no_broken_teardown_tasks():
+    result = _policy_for("ec2", account_id="123456789012", region="us-east-1",
+                         include_destructive_actions=True)
+    assert result["teardown_tasks_affected"] is None
+    assert result["destructive_actions_withheld"] is None
+
+
+
+# --- preflight cleanup must work under the DEFAULT policy --------------------
+# The default is AllowWorkflowDeletion=false, and preflight always deletes the
+# throwaway workflow it creates. Withholding DeleteWorkflow entirely does not make
+# that safe, it makes preflight leak one workflow per call against a 100-per-account
+# quota — while the README promises the throwaway is cleaned up. These tests bind the
+# probe name to the IAM grant so the two cannot drift apart.
+
+
+def _template_statements():
+    """Literal statements from the function's inline policy. !If-wrapped statements
+    render as None through the tag-ignoring loader, so what survives is exactly the set
+    that is granted unconditionally — which is the point of these tests."""
+    doc = _load_cfn((REPO_ROOT / "template.yaml").read_text())
+    policies = doc["Resources"]["McpFunction"]["Properties"]["Policies"]
+    return [s for block in policies for s in block["Statement"] if isinstance(s, dict)]
+
+
+def test_preflight_can_delete_its_throwaway_without_the_deletion_parameter():
+    """The grant must be UNCONDITIONAL. If it only appears under DeletionAllowed then
+    the documented default deployment cannot clean up after a preflight."""
+    unconditional = _template_statements()
+    sids = [s["Sid"] for s in unconditional]
+    assert "DeletePreflightThrowawayOnly" in sids, (
+        "no unconditional DeleteWorkflow grant for preflight. With "
+        "AllowWorkflowDeletion=false the throwaway workflow leaks on every call."
+    )
+
+    statement = next(s for s in unconditional if s["Sid"] == "DeletePreflightThrowawayOnly")
+    action = statement["Action"]
+    actions = action if isinstance(action, list) else [action]
+    assert actions == ["airflow-serverless:DeleteWorkflow"], \
+        f"this statement must grant nothing but DeleteWorkflow, got {actions}"
+
+
+def _preflight_delete_resource_line():
+    """The raw Resource line for the preflight delete grant.
+
+    Read from the source text rather than the parsed tree on purpose: the resource is a
+    !Sub, which the tag-ignoring loader renders as None, so the parsed form cannot show
+    what it is scoped to. The scope is the only thing standing between an ungated delete
+    grant and real workflows, so it has to be checked literally.
+    """
+    text = (REPO_ROOT / "template.yaml").read_text()
+    block = text.split("Sid: DeletePreflightThrowawayOnly", 1)
+    assert len(block) == 2, "the preflight delete statement is gone from template.yaml"
+    for line in block[1].splitlines():
+        if "Resource:" in line:
+            return line
+    raise AssertionError("no Resource line under DeletePreflightThrowawayOnly")
+
+
+def test_the_preflight_delete_grant_cannot_reach_a_user_named_workflow():
+    """It is unconditional, so its resource scope is the only thing keeping it from
+    deleting production workflows."""
+    line = _preflight_delete_resource_line()
+    assert f"workflow/{operations._PREFLIGHT_NAME_PREFIX}*" in line, (
+        f"resource {line.strip()!r} must be scoped to workflow/"
+        f"{operations._PREFLIGHT_NAME_PREFIX}* — anything wider makes an ungated "
+        f"delete grant that reaches real workflows"
+    )
+    assert "workflow/*" not in line, "that would delete anything in the account"
+
+
+def test_the_probe_name_matches_the_iam_resource_prefix():
+    """The IAM grant is a prefix match against a name this code generates. Renaming the
+    probe without updating template.yaml would remove preflight's ability to clean up,
+    and nothing else would notice."""
+    line = _preflight_delete_resource_line()
+    granted_prefix = line.split("workflow/", 1)[1].split("'")[0].rstrip("*")
+    assert granted_prefix, f"could not read a prefix out of {line.strip()!r}"
+
+    for _ in range(5):
+        probe = operations._PREFLIGHT_NAME_PREFIX + uuid.uuid4().hex[:8]
+        assert probe.startswith(granted_prefix), \
+            f"probe {probe!r} is not covered by the IAM prefix {granted_prefix!r}"
+
+
+def test_preflight_diagnoses_a_missing_delete_grant(monkeypatch):
+    """When cleanup is denied the caller must be told it is an IAM gap and which
+    statement is missing — not left with a bare API error."""
+    arn = "arn:aws:airflow-serverless:us-west-1:111122223333:workflow/preflight-abc-XyZ"
+
+    class Client:
+        def create_workflow(self, **kwargs):
+            return {"WorkflowArn": arn, "Warnings": []}
+
+        def delete_workflow(self, **kwargs):
+            raise RuntimeError(
+                "AccessDeniedException: User is not authorized to perform: "
+                "airflow-serverless:DeleteWorkflow"
+            )
+
+    class S3:
+        def put_object(self, **kwargs):
+            return {}
+
+        def delete_object(self, **kwargs):
+            return {}
+
+    monkeypatch.setattr(operations, "_get_client", lambda: Client())
+    monkeypatch.setattr(operations.boto3, "client", lambda name, **kw: S3())
+
+    result = operations.preflight_definition(
+        "d:\n  tasks:\n    t:\n      operator: airflow.providers.standard.operators.empty.EmptyOperator\n",
+        "some-bucket",
+        "arn:aws:iam::111122223333:role/r",
+    )
+
+    assert "could not delete" in result["cleanup"]
+    assert "DeletePreflightThrowawayOnly" in result["cleanup_fix"]
+    assert "AllowWorkflowDeletion" in result["cleanup_fix"]
+    assert "quota" in result["cleanup_fix"]
+
+
+
+# --- preflight must fail closed ---------------------------------------------
+# The dangerous outcome is not "rejected", it is "reported as valid when nothing was
+# checked". An agent reads `valid` and deploys.
+
+_MINIMAL_DAG = (
+    "d:\n  tasks:\n    t:\n"
+    "      operator: airflow.providers.standard.operators.empty.EmptyOperator\n"
+)
+
+
+class _PreflightS3:
+    """S3 double whose put_object can be made to fail for the definition, the code
+    bundle, or neither."""
+
+    def __init__(self, fail_on=()):
+        self.fail_on = fail_on
+        self.put = []
+
+    def put_object(self, **kwargs):
+        key = kwargs.get("Key", "")
+        suffix = ".zip" if key.endswith(".zip") else ".yaml"
+        if suffix in self.fail_on:
+            raise RuntimeError("AccessDenied: not authorized to perform s3:PutObject")
+        self.put.append(key)
+        return {}
+
+    def delete_object(self, **kwargs):
+        return {}
+
+
+class _PreflightClient:
+    def __init__(self, accept=True):
+        self.accept = accept
+        self.created = []
+
+    def create_workflow(self, **kwargs):
+        self.created.append(kwargs)
+        if not self.accept:
+            raise RuntimeError("Workflow validation failed: bad operator argument")
+        return {
+            "WorkflowArn": "arn:aws:airflow-serverless:us-west-1:111122223333:"
+                           "workflow/preflight-abc-XyZ",
+            "Warnings": [],
+        }
+
+    def delete_workflow(self, **kwargs):
+        return {}
+
+
+def _run_preflight(monkeypatch, s3, client, **kwargs):
+    monkeypatch.setattr(operations, "_get_client", lambda: client)
+    monkeypatch.setattr(operations.boto3, "client", lambda name, **kw: s3)
+    return operations.preflight_definition(
+        _MINIMAL_DAG, "some-bucket", "arn:aws:iam::111122223333:role/r", **kwargs
+    )
+
+
+def test_a_definition_that_never_reached_the_service_is_not_valid(monkeypatch):
+    """Local validation passing is not the service's verdict. Copying it into `valid`
+    told callers the service had accepted YAML it never saw."""
+    result = _run_preflight(
+        monkeypatch, _PreflightS3(fail_on=(".yaml",)), _PreflightClient()
+    )
+    assert result["verdict"] == "indeterminate"
+    assert result["valid"] is False
+    assert result["local_validation"]["valid"] is True, "local really did pass"
+    assert "never validated it" in result["why_indeterminate"]
+
+
+def test_an_unstaged_code_bundle_is_not_a_pass(monkeypatch):
+    """The service accepts the definition, but the Python/Bash tasks were not checked,
+    which is the only reason the bundle was passed in the first place."""
+    monkeypatch.setattr(operations, "_supports_code_param", lambda: True)
+    result = _run_preflight(
+        monkeypatch, _PreflightS3(fail_on=(".zip",)), _PreflightClient(),
+        code_zip_base64="UEsDBBQAAAAIAA==",
+    )
+    assert result["service_validation"] == "accepted"
+    assert result["verdict"] == "indeterminate"
+    assert result["valid"] is False
+    assert "NOT validated" in result["why_indeterminate"]
+    assert result["code_bundle_warning"]
+
+
+def test_a_fully_checked_definition_is_valid(monkeypatch):
+    result = _run_preflight(monkeypatch, _PreflightS3(), _PreflightClient())
+    assert result["verdict"] == "valid"
+    assert result["valid"] is True
+
+
+def test_a_service_rejection_is_invalid_not_indeterminate(monkeypatch):
+    """Rejected and unknown are different answers and must not be conflated: one means
+    fix the YAML, the other means run the check again."""
+    result = _run_preflight(monkeypatch, _PreflightS3(), _PreflightClient(accept=False))
+    assert result["verdict"] == "invalid"
+    assert result["valid"] is False
+    assert "bad operator argument" in result["service_error"]
+
+
+def test_local_errors_short_circuit_as_invalid(monkeypatch):
+    monkeypatch.setattr(operations, "_get_client", lambda: _PreflightClient())
+    monkeypatch.setattr(operations.boto3, "client", lambda name, **kw: _PreflightS3())
+    result = operations.preflight_definition(
+        "d:\n  tasks:\n    t:\n      operator: not.a.real.Operator\n",
+        "some-bucket", "arn:aws:iam::111122223333:role/r",
+    )
+    assert result["verdict"] == "invalid"
+    assert result["valid"] is False
+
+
+def test_valid_is_never_true_without_a_service_acceptance(monkeypatch):
+    """The invariant behind all of the above, stated once so it cannot regress:
+    `valid` is True only when the service itself accepted the artifact."""
+    cases = [
+        (_PreflightS3(fail_on=(".yaml",)), _PreflightClient(), {}),
+        (_PreflightS3(), _PreflightClient(accept=False), {}),
+    ]
+    for s3, client, kwargs in cases:
+        result = _run_preflight(monkeypatch, s3, client, **kwargs)
+        if result.get("service_validation") != "accepted":
+            assert result["valid"] is False, result
+
+
+
+def test_an_oversized_bundle_leaves_nothing_behind_in_s3(monkeypatch, stubbed):
+    """The payload guards are pure local checks, so they must run before the first AWS
+    call. Running them after the definition upload meant a request that was always going
+    to fail still wrote an object into the caller's bucket."""
+    writes = []
+
+    class S3:
+        def put_object(self, **kwargs):
+            writes.append(kwargs.get("Key"))
+            return {}
+
+    monkeypatch.setattr(operations.boto3, "client", lambda name, **kw: S3())
+
+    oversized = "A" * (operations._MAX_INLINE_CODE_BYTES * 4 // 3 + 8)
+    result = operations.deploy_and_run("wf", _MINIMAL_DAG, "bucket", "role",
+                                       code_zip_base64=oversized)
+
+    assert "error" in result
+    assert writes == [], f"nothing should have been written, got {writes}"

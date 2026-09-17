@@ -29,7 +29,27 @@ _SSE_ALGORITHM = "AES256"
 
 # Guard on the code bundle before it is decoded: base64 inflates by 4/3, and this
 # function has 512 MB of memory, so an oversized payload is a cheap way to OOM it.
-_MAX_CODE_ZIP_BYTES = 250 * 1024 * 1024
+#
+# Two separate ceilings apply and they are an order of magnitude apart. MWAA Serverless
+# accepts 250 MB of code, but a bundle passed INLINE has to fit in the request carrying
+# it, and a Lambda request is capped at 6 MB
+# (https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html). Enforcing only the
+# service quota means a remote caller gets a transport failure instead of a clear error,
+# somewhere around 4 MB of actual zip. Anything larger belongs in S3, referenced by
+# code_s3_key — which is the right pattern for a real bundle regardless.
+_MWAA_MAX_CODE_BYTES = 250 * 1024 * 1024
+_LAMBDA_SYNC_PAYLOAD = 6 * 1024 * 1024
+_MAX_INLINE_CODE_BYTES = int((_LAMBDA_SYNC_PAYLOAD - 256 * 1024) * 3 / 4)
+
+# Name prefix for the throwaway workflow preflight_definition creates.
+#
+# This is an IAM CONTRACT, not a cosmetic choice. template.yaml grants DeleteWorkflow on
+# workflow/preflight-* WITHOUT gating it on AllowWorkflowDeletion, so that preflight can
+# clean up after itself even on a deployment where the general delete tool is switched
+# off. Change this prefix and preflight silently loses the right to delete its own
+# throwaway, which leaks one workflow per call against the 100-per-account quota.
+# tests/test_security.py asserts the two stay in step.
+_PREFLIGHT_NAME_PREFIX = "preflight-"
 
 
 def _put_object(s3, bucket, key, body, expected_bucket_owner=""):
@@ -648,6 +668,43 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
             "hint": "Call repair_dag_yaml to fix the mechanical problems, then redeploy.",
         }
 
+    # Payload guards go here, BEFORE the first AWS call. They are pure local checks, and
+    # running them after the definition upload meant an oversized bundle still left a
+    # stray object in the caller's bucket on the way to failing.
+    if code_zip_base64:
+        # Size first. An oversized payload is refused whatever the runtime supports, and
+        # the encoded length is checked BEFORE decoding: base64 expands by 4/3, and this
+        # function has 512 MB, so decoding first is an easy way to OOM it.
+        #
+        # The bound is the TRANSPORT's, not the service's. A bundle between this and the
+        # 250 MB MWAA quota is legal for MWAA but cannot fit in the request that would
+        # carry it here, and failing with a clear message beats a truncated request.
+        if len(code_zip_base64) > _MAX_INLINE_CODE_BYTES * 4 // 3:
+            return {
+                "error": (
+                    f"code_zip_base64 decodes to more than "
+                    f"{_MAX_INLINE_CODE_BYTES // (1024 * 1024)} MB, which is the largest bundle "
+                    f"that can be passed INLINE. MWAA Serverless itself accepts up to "
+                    f"{_MWAA_MAX_CODE_BYTES // (1024 * 1024)} MB — the smaller limit is the "
+                    f"6 MB cap on a Lambda request, which base64 fills a third faster."
+                ),
+                "fix": (
+                    "Upload the zip to S3 yourself and pass code_s3_key instead of "
+                    "code_zip_base64. The workflow references the object, so nothing large "
+                    "travels through this server. This is the recommended path for any "
+                    "bundle big enough to hit this."
+                ),
+            }
+        if not _supports_code_param():
+            return {"error": "This runtime's botocore does not support the CreateWorkflow `Code` "
+                             "parameter. Upgrade boto3 to >= 1.40 to deploy Python/Bash tasks."}
+        try:
+            blob = base64.b64decode(code_zip_base64, validate=True)
+        except Exception as e:  # noqa: BLE001 - surfaced to the caller
+            return {"error": f"code_zip_base64 is not valid base64: {e}"}
+    else:
+        blob = None
+
     try:
         _put_object(s3, s3_bucket, s3_key, yaml_content.encode("utf-8"), expected_bucket_owner)
     except Exception as e:  # noqa: BLE001 - surfaced to the caller
@@ -655,21 +712,10 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
 
     s3_loc = {"Bucket": s3_bucket, "ObjectKey": s3_key}
 
-    # Optional code bundle for Python/Bash tasks
+    # Optional code bundle for Python/Bash tasks. Already validated and decoded above,
+    # before any AWS call.
     code_arg = {}
     if code_zip_base64:
-        if not _supports_code_param():
-            return {"error": "This runtime's botocore does not support the CreateWorkflow `Code` "
-                             "parameter. Upgrade boto3 to >= 1.40 to deploy Python/Bash tasks."}
-        # Check the encoded length BEFORE decoding: base64 expands by 4/3, and this
-        # function has 512 MB, so decoding first is an easy way to OOM it.
-        if len(code_zip_base64) > _MAX_CODE_ZIP_BYTES * 4 // 3:
-            return {"error": f"code_zip_base64 decodes to more than "
-                             f"{_MAX_CODE_ZIP_BYTES // (1024 * 1024)} MB, over the code bundle limit."}
-        try:
-            blob = base64.b64decode(code_zip_base64, validate=True)
-        except Exception as e:  # noqa: BLE001 - surfaced to the caller
-            return {"error": f"code_zip_base64 is not valid base64: {e}"}
         ckey = code_s3_key or f"workflows/code/{workflow_name}.zip"
         try:
             _put_object(s3, s3_bucket, ckey, blob, expected_bucket_owner)
@@ -760,6 +806,15 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
     anything the local validator cannot know about — such as an operator argument
     the installed provider version does not accept.
 
+    `verdict` is three-state and is the field to branch on:
+        "valid"         the service accepted the exact artifact you passed
+        "invalid"       local or service validation rejected it; see the errors
+        "indeterminate" the check could not be completed, so nothing is known.
+                        `why_indeterminate` says what was missed.
+    `valid` is a strict boolean alias: it is True only for "valid". It is never set
+    from the LOCAL result — reporting a local pass as the verdict when the service
+    never saw the definition is what makes automation deploy unvalidated YAML.
+
     Side effects the caller should know about: it writes (and deletes) two objects in
     s3_bucket, and it consumes one of the 100 workflows-per-account quota slots for
     the duration. If the delete fails, `cleanup` says so and names the leftover.
@@ -776,23 +831,35 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
                                 "warnings": local["warnings"], "hints": local["hints"]}}
     if not local["valid"]:
         out["service_validation"] = "skipped — fix the local errors first"
+        out["verdict"] = "invalid"
         out["valid"] = False
         return out
 
     client = _get_client()
     s3 = boto3.client("s3")
-    probe = f"preflight-{uuid.uuid4().hex[:8]}"
+    probe = f"{_PREFLIGHT_NAME_PREFIX}{uuid.uuid4().hex[:8]}"
     key = f"preflight/{probe}.yaml"
     ckey = None
     arn = None
     try:
         _put_object(s3, s3_bucket, key, yaml_content.encode("utf-8"), expected_bucket_owner)
     except Exception as e:  # noqa: BLE001 - surfaced to the caller
+        # FAIL CLOSED. The local result is not a substitute for the service's verdict,
+        # and reporting the local one as `valid` here told automation the service had
+        # accepted a definition it never saw.
         out["service_validation"] = f"skipped — S3 upload failed: {e}"
-        out["valid"] = local["valid"]
+        out["verdict"] = "indeterminate"
+        out["valid"] = False
+        out["why_indeterminate"] = (
+            f"The definition could not be staged in s3://{s3_bucket}, so MWAA Serverless "
+            f"never validated it. Local validation passed, but local checks cannot know "
+            f"what the installed provider versions accept — that is the whole reason to "
+            f"preflight. Fix the S3 access and re-run before treating this as deployable."
+        )
         return out
 
     extra = {}
+    code_bundle_unstaged = False
     if code_zip_base64 and _supports_code_param():
         ckey = f"preflight/{probe}.zip"
         try:
@@ -802,6 +869,7 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
             log.warning("Preflight code bundle upload failed: %s", e)
             ckey = None
+            code_bundle_unstaged = True
             out["code_bundle_warning"] = (
                 f"The code bundle could not be staged ({e}), so the service validated the "
                 f"definition WITHOUT it. Python/Bash tasks were not checked."
@@ -817,11 +885,25 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
         arn = resp.get("WorkflowArn")
         out["service_validation"] = "accepted"
         out["service_warnings"] = resp.get("Warnings") or []
-        out["valid"] = True
+        if code_bundle_unstaged:
+            # The service accepted the DEFINITION, but not the artifact the caller
+            # actually meant to check. Reporting that as valid would greenlight a
+            # deployment whose Python and Bash tasks were never validated.
+            out["verdict"] = "indeterminate"
+            out["valid"] = False
+            out["why_indeterminate"] = (
+                "The service accepted the definition, but the code bundle was not staged, "
+                "so the PythonOperator/BashOperator tasks in it were NOT validated. This is "
+                "not a pass — stage the bundle and re-run."
+            )
+        else:
+            out["verdict"] = "valid"
+            out["valid"] = True
     except Exception as e:  # noqa: BLE001 - the rejection IS the result here
         msg = str(e)
         out["service_validation"] = "rejected"
         out["service_error"] = msg.split("Workflow validation failed:")[-1].strip() or msg
+        out["verdict"] = "invalid"
         out["valid"] = False
     finally:
         if arn:
@@ -835,6 +917,16 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
                     f"could not delete throwaway workflow {arn}: {e}. Delete it manually — it "
                     f"counts against the 100-workflow quota."
                 )
+                if "AccessDenied" in str(e) or "not authorized" in str(e):
+                    out["cleanup_fix"] = (
+                        f"This is an IAM gap, not a service error: the caller lacks "
+                        f"airflow-serverless:DeleteWorkflow on {arn}. On the Lambda deployment "
+                        f"that grant is the DeletePreflightThrowawayOnly statement, scoped to "
+                        f"workflow/{_PREFLIGHT_NAME_PREFIX}* and NOT gated on "
+                        f"AllowWorkflowDeletion. If it is missing, redeploy the current "
+                        f"template.yaml. Every preflight call leaks one workflow until then, "
+                        f"and 100 of them exhaust the account quota."
+                    )
         leftovers = []
         for stale_key in [k for k in (key, ckey) if k]:
             try:

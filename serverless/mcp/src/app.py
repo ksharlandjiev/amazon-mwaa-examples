@@ -335,6 +335,13 @@ def preflight_dag_yaml(yaml_content: str, s3_bucket: str, execution_role_arn: st
     silently drop), and deletes the throwaway. Catches things a local check cannot,
     such as an argument the installed provider version does not accept.
 
+    Branch on `verdict`, which is three-state: "valid" means the service accepted the
+    exact artifact you passed; "invalid" means it was rejected; "indeterminate" means
+    the check could not be completed and NOTHING is known — a staging failure, or a
+    code bundle that never reached S3 so the Python/Bash tasks went unchecked. Treat
+    "indeterminate" as "not validated", never as a pass. `valid` is True only for
+    "valid".
+
     Side effects: writes and deletes two objects in s3_bucket, and briefly consumes
     one of the 100 workflows-per-account quota slots. If cleanup fails, the response
     names the leftover workflow and objects so you can remove them. The service also
@@ -355,23 +362,30 @@ def preflight_dag_yaml(yaml_content: str, s3_bucket: str, execution_role_arn: st
 @mcp_server.tool()
 def generate_execution_role(yaml_content: str, account_id: str = "", region: str = "",
                             passable_role_arns: Optional[list] = None,
-                            include_destructive_actions: bool = True) -> str:
+                            include_destructive_actions: bool = False) -> str:
     """Produce an IAM execution role for a DAG: trust policy, permissions policy
     scoped to the API calls its operators actually make, and the CLI commands to
     create it.
 
-    NO statement uses Resource "*". Each grant is scoped to one service, in one
-    region, in one account, and the response tells you how to narrow it further to
-    individual job/table/queue ARNs. Pass account_id and region to get real ARNs;
-    omit them and the policy comes back with ${ACCOUNT_ID}/${REGION} placeholders and
-    a file-based apply sequence, so a wildcard policy can never be pasted by accident.
+    Every statement is scoped to one service, in one region, in one account, and the
+    response tells you how to narrow it further to individual job/table/queue ARNs.
+    The exception is the *Unscopable statement(s): IAM defines no resource type for a
+    few actions (ec2:DescribeInstances and friends), so an ARN would DENY them at run
+    time. Those are isolated into their own statement with Resource "*" and listed in
+    `scope_down`. Do not merge them back in, and do not "fix" them with an ARN — that
+    is exactly the bug this sample shipped in its own Lambda policy, which deployed
+    cleanly and then denied every call.
+
+    Pass account_id and region to get real ARNs; omit them and the policy comes back
+    with ${ACCOUNT_ID}/${REGION} placeholders and a file-based apply sequence.
 
     region also selects the ARN partition — a policy written with arn:aws matches
     nothing in GovCloud or China, which shows up as tasks mysteriously losing
     permissions rather than as an error.
 
-    Delete*/Terminate* actions go in their own Destructive* statement so you can
-    delete them outright when the DAG does not create the resources it operates on.
+    Delete*/Terminate* actions are WITHHELD BY DEFAULT and reported in
+    `destructive_actions_withheld`. A DAG that tears down what it created needs
+    include_destructive_actions=True; everything else should stay unable to destroy.
 
     iam:PassRole is added only when a task genuinely hands a role to another service,
     and is constrained both by iam:PassedToService and by role ARN. PassRole to
@@ -384,7 +398,7 @@ def generate_execution_role(yaml_content: str, account_id: str = "", region: str
         account_id: Your AWS account id. Omit for a placeholder policy.
         region: Region the workflow runs in. Also selects the ARN partition.
         passable_role_arns: Exact role ARNs the DAG's tasks pass to other services
-        include_destructive_actions: Set false for a DAG that only reads and runs jobs
+        include_destructive_actions: Grant Delete*/Terminate*. Defaults to false.
     """
     return _j(generate_execution_role_policy(yaml_content, account_id, region,
                                              passable_role_arns, include_destructive_actions))

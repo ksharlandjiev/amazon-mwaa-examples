@@ -836,6 +836,65 @@ _BUCKET_PLACEHOLDER = "${BUCKET_NAME}"
 # IAM role names are limited to 64 characters.
 _MAX_ROLE_NAME_LEN = 64
 
+# ── Actions IAM will not let you resource-scope ──
+#
+# IAM resource support is per ACTION, not per service. Some actions operate on a
+# collection rather than an item and have no resource type at all; giving one of those
+# a resource ARN produces an implicitDeny at run time. Nothing catches that locally:
+# the policy is syntactically valid, cfn-lint passes, and a unit test that only forbids
+# Resource: "*" actively demands the broken form.
+#
+# This sample learned that the hard way. Its own Lambda policy scoped
+# airflow-serverless:CreateWorkflow to a workflow ARN, which deployed cleanly and then
+# denied every call — the workflow does not exist yet, so there is nothing to name.
+# See the CollectionLevelOperations statement in template.yaml.
+#
+# Membership here is deliberately conservative. An action wrongly listed here is
+# granted more broadly than it needs to be, which is a security cost a reader inherits
+# silently; an action wrongly left out fails loudly with AccessDenied and can be added.
+# So only actions whose lack of resource support is established belong here, and
+# `verify_generated_policies.py` re-checks the whole set against live IAM with
+# iam:SimulateCustomPolicy.
+_WILDCARD_ONLY_ACTIONS = {
+    # Verified live against this account: the workflow does not exist yet, so a
+    # workflow ARN cannot authorise its own creation.
+    "airflow-serverless:CreateWorkflow",
+    # ec2:Describe* defines no resource types whatsoever.
+    "ec2:DescribeInstances",
+    "ec2:DescribeInstanceStatus",
+    # RDS Describe* filter the account's collection rather than reading one item.
+    "rds:DescribeDBInstances",
+    "rds:DescribeDBClusters",
+    "rds:DescribeDBSnapshots",
+    "rds:DescribeExportTasks",
+    # Batch Describe* accept lists of ids and authorise at the collection.
+    "batch:DescribeJobs",
+    "batch:DescribeJobQueues",
+    "batch:DescribeComputeEnvironments",
+    # DMS Describe* filter the collection.
+    "dms:DescribeReplicationTasks",
+    # Redshift Describe* enumerate clusters and snapshots.
+    "redshift:DescribeClusters",
+    "redshift:DescribeClusterSnapshots",
+    # The Redshift Data API addresses statement ids, which are not IAM resources.
+    "redshift-data:DescribeStatement",
+    "redshift-data:GetStatementResult",
+    "redshift-data:CancelStatement",
+    # A task definition is not a resource for these two.
+    "ecs:DescribeTaskDefinition",
+    "ecs:RegisterTaskDefinition",
+    # DataSync List* enumerate the account.
+    "datasync:ListTasks",
+    "datasync:ListLocations",
+    # Collection-level by name.
+    "aoss:BatchGetCollection",
+    # Comprehend's PII detection jobs have no resource type.
+    "comprehend:DescribePiiEntitiesDetectionJob",
+    "comprehend:StartPiiEntitiesDetectionJob",
+    # Crawler metrics are reported account-wide.
+    "glue:GetCrawlerMetrics",
+}
+
 
 def _partition_for_region(region: str) -> str:
     """AWS partition for a region. A policy written with arn:aws is inert in
@@ -861,22 +920,28 @@ def _role_name_for(dag_id: str) -> str:
 
 
 def _resources_for_actions(actions, partition, region, account):
-    """Group actions by their IAM service prefix and give each group a scoped
-    resource ARN, instead of one blanket Resource: "*".
+    """Group actions into statements, each with the narrowest resource IAM accepts.
 
-    The ARN is derived from the action's own service prefix rather than a
-    hand-maintained per-operator table, so it cannot drift out of sync with
-    _OPERATOR_IAM_MAP. It scopes every grant to one service, in one region, in one
-    account — narrower than "*" by construction, and still a pattern the reader is
-    told to narrow further to individual job/table/queue ARNs.
+    Returns (service, actions, resources, scopable) tuples. `scopable` is False for the
+    group whose actions IAM refuses to resource-scope — those get Resource: "*" because
+    anything else denies them at run time. Every other group is scoped to one service,
+    in one region, in one account, which the caller is told to narrow further to the
+    individual job, table and queue ARNs the DAG names.
+
+    Splitting on _WILDCARD_ONLY_ACTIONS rather than emitting one ARN per service is the
+    whole point: a service-wide ARN cannot express a per-action rule, so a single
+    statement is necessarily wrong for one half of the actions or the other.
     """
-    by_service = {}
+    scopable_by_service = {}
+    unscopable_by_service = {}
     for action in actions:
         service = action.split(":", 1)[0]
-        by_service.setdefault(service, []).append(action)
+        bucket = (unscopable_by_service if action in _WILDCARD_ONLY_ACTIONS
+                  else scopable_by_service)
+        bucket.setdefault(service, []).append(action)
 
     grouped = []
-    for service, svc_actions in sorted(by_service.items()):
+    for service, svc_actions in sorted(scopable_by_service.items()):
         if service == "s3":
             resources = [
                 f"arn:{partition}:s3:::{_BUCKET_PLACEHOLDER}",
@@ -891,13 +956,40 @@ def _resources_for_actions(actions, partition, region, account):
             arn_region = "" if service in _REGIONLESS_ARN_SERVICES else region
             arn_account = "" if service in _ACCOUNTLESS_ARN_SERVICES else account
             resources = [f"arn:{partition}:{service}:{arn_region}:{arn_account}:*"]
-        grouped.append((service, sorted(svc_actions), resources))
+        grouped.append((service, sorted(svc_actions), resources, True))
+
+    for service, svc_actions in sorted(unscopable_by_service.items()):
+        grouped.append((service, sorted(svc_actions), ["*"], False))
+
     return grouped
+
+
+def _tasks_needing_destructive_actions(data):
+    """Task ids whose operator name says it deletes or terminates something.
+
+    Withholding destruction by default is the right default, but silently withholding
+    it from a DAG that tears down its own resources just moves the damage: the teardown
+    task fails with AccessDenied and the resources it should have removed are left
+    behind and keep billing. So the caller gets told which tasks those are, by name,
+    and decides.
+    """
+    hits = []
+    verbs = tuple(v.lower() for v in _DESTRUCTIVE_ACTION_VERBS)
+    for dag_cfg in (data or {}).values():
+        tasks = (dag_cfg or {}).get("tasks")
+        if not isinstance(tasks, dict):
+            continue
+        for task_id, task_cfg in tasks.items():
+            operator = str((task_cfg or {}).get("operator", ""))
+            leaf = operator.rsplit(".", 1)[-1].lower()
+            if any(verb in leaf for verb in verbs):
+                hits.append(task_id)
+    return sorted(hits)
 
 
 def generate_execution_role_policy(yaml_content, account_id: str = "", region: str = "",
                                    passable_role_arns=None,
-                                   include_destructive_actions: bool = True):
+                                   include_destructive_actions: bool = False):
     """Generate an IAM execution role policy and CLI commands for a given DAG YAML.
 
     Args:
@@ -911,8 +1003,10 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
         passable_role_arns: Exact role ARNs the DAG's tasks hand to other services.
             Required to grant iam:PassRole to CloudFormation, which is a
             privilege-escalation path when left unscoped.
-        include_destructive_actions: Keep Delete*/Terminate* actions. Set false for a
-            DAG that only reads and runs jobs.
+        include_destructive_actions: Grant Delete*/Terminate* actions. DEFAULTS TO
+            FALSE, so the policy cannot destroy anything until you opt in. A DAG that
+            tears down what it created needs true; check
+            `destructive_actions_withheld` in the result to see exactly what that adds.
     """
     import json as _json
     try:
@@ -963,20 +1057,22 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
         "Resource": f"arn:{partition}:logs:{arn_region}:{account}:log-group:/aws/mwaa-serverless/*",
     }]
 
-    for service, svc_actions, resources in _resources_for_actions(
+    for service, svc_actions, resources, scopable in _resources_for_actions(
             granted, partition, arn_region, account):
         statements.append({
-            "Sid": f"Operator{service.replace('-', '').title()}",
+            "Sid": f"Operator{service.replace('-', '').title()}"
+                   + ("" if scopable else "Unscopable"),
             "Effect": "Allow",
             "Action": svc_actions,
             "Resource": resources[0] if len(resources) == 1 else resources,
         })
 
     if include_destructive_actions and destructive:
-        for service, svc_actions, resources in _resources_for_actions(
+        for service, svc_actions, resources, scopable in _resources_for_actions(
                 destructive, partition, arn_region, account):
             statements.append({
-                "Sid": f"Destructive{service.replace('-', '').title()}",
+                "Sid": f"Destructive{service.replace('-', '').title()}"
+                       + ("" if scopable else "Unscopable"),
                 "Effect": "Allow",
                 "Action": svc_actions,
                 "Resource": resources[0] if len(resources) == 1 else resources,
@@ -1057,6 +1153,34 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
             + ", ".join(destructive[:6]) + ("..." if len(destructive) > 6 else "")
             + " within the scoped ARNs."
         )
+    elif destructive:
+        teardown_tasks = _tasks_needing_destructive_actions(data)
+        note = (
+            "Destructive actions were WITHHELD (include_destructive_actions defaults to "
+            "false), so tasks that tear down resources will fail with AccessDenied until "
+            "you opt in. Withheld: "
+            + ", ".join(destructive[:6]) + ("..." if len(destructive) > 6 else "")
+            + ". Re-run with include_destructive_actions=True only if this DAG created "
+            "what it deletes."
+        )
+        if teardown_tasks:
+            note += (
+                f" THIS DAG HAS TEARDOWN TASKS: {', '.join(teardown_tasks)}. The delete tasks "
+                f"will fail with AccessDenied and any sensor waiting on them will then hang "
+                f"until it times out, leaving the resources they were meant to remove in "
+                f"place and still billing. A DAG that creates what it deletes is exactly the "
+                f"case where include_destructive_actions=True is the correct answer."
+            )
+        scope_down.append(note)
+    unscopable = sorted(set(all_actions) & _WILDCARD_ONLY_ACTIONS)
+    if unscopable:
+        scope_down.append(
+            "The *Unscopable statement(s) use Resource: \"*\" because IAM defines no "
+            "resource type for these actions, so any ARN would deny them at run time: "
+            + ", ".join(unscopable)
+            + ". Constrain them with condition keys instead of an ARN, and do not "
+            "merge them back into the scoped statements."
+        )
     if principals:
         scope_down.append(
             "Replace the iam:PassRole Resource with the exact role ARNs your tasks pass."
@@ -1109,6 +1233,10 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
         "unmapped_services": sorted(unmapped) or None,
         "destructive_actions_granted": destructive if include_destructive_actions else None,
         "destructive_actions_withheld": withheld or None,
+        "teardown_tasks_affected": (
+            _tasks_needing_destructive_actions(data) or None
+            if withheld else None
+        ),
         "passrole_required_for": passrole_services or None,
         "passrole_notes": passrole_notes or None,
         "code_bundle_note": (

@@ -150,6 +150,21 @@ Resources:
                 - airflow-serverless:StartWorkflowRun
                 - airflow-serverless:StopWorkflowRun
               Resource: !Sub 'arn:${AWS::Partition}:airflow-serverless:${AWS::Region}:${AWS::AccountId}:workflow/*'
+            # preflight_dag_yaml creates a throwaway workflow so the SERVICE validates
+            # the definition, then deletes it. That delete needs DeleteWorkflow — and
+            # withholding it does not make preflight safe, it makes preflight LEAK: the
+            # throwaway survives, and 100 of those exhaust the per-account quota.
+            #
+            # So this grant is NOT gated on AllowWorkflowDeletion. It is scoped to the
+            # preflight-* name prefix instead, which the probe name in
+            # operations.preflight_definition is built to match (a test enforces the
+            # prefix so a rename cannot silently break this). It cannot touch a workflow
+            # a user named, and the general-purpose delete tool still requires the
+            # parameter below.
+            - Sid: DeletePreflightThrowawayOnly
+              Effect: Allow
+              Action: airflow-serverless:DeleteWorkflow
+              Resource: !Sub 'arn:${AWS::Partition}:airflow-serverless:${AWS::Region}:${AWS::AccountId}:workflow/preflight-*'
             - !If
               - DeletionAllowed
               - Sid: WorkflowDelete

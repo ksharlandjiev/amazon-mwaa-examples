@@ -25,8 +25,28 @@ import yaml
 from constraints import CODE_SUPPORT, QUOTAS
 from schema import resolve_operator_fqn
 
-_MAX_BUNDLE_BYTES = 250 * 1024 * 1024
 _PREINSTALLED = set(CODE_SUPPORT["preinstalled_packages"])
+
+# ── Three different ceilings, often confused for one ──
+#
+# MWAA Serverless accepts a code bundle of up to 250 MB, and that is the number the
+# service documents. It is NOT the number that applies to a bundle travelling through
+# this server, and quoting it alone is how a caller ends up with a request that fails
+# far below the "limit".
+#
+#   _MWAA_MAX_CODE_BYTES     what the SERVICE accepts, once the zip is in S3.
+#   _LAMBDA_SYNC_PAYLOAD     what a Lambda request/response can carry: 6 MB, hard.
+#                            https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html
+#   _MAX_INLINE_BUNDLE_BYTES what THIS tool accepts inline, derived from the transport.
+#
+# The inline ceiling is the transport limit minus base64 inflation (4/3) and a margin
+# for the surrounding JSON-RPC envelope, so a bundle that passes here still fits in the
+# request that carries it. Bundles larger than that must go to S3 directly and be
+# referenced by key — which is the better pattern for any real bundle anyway.
+_MWAA_MAX_CODE_BYTES = 250 * 1024 * 1024
+_LAMBDA_SYNC_PAYLOAD = 6 * 1024 * 1024
+_JSON_ENVELOPE_MARGIN = 256 * 1024
+_MAX_INLINE_BUNDLE_BYTES = int((_LAMBDA_SYNC_PAYLOAD - _JSON_ENVELOPE_MARGIN) * 3 / 4)
 
 # Imports that will fail or hang at run time because tasks have no internet access
 # and only a subset of AWS endpoints is reachable without a VPC.
@@ -89,12 +109,14 @@ def build_code_bundle(files, bundle_name: str = "code.zip") -> dict:
             zf.writestr(name, content)
     raw = buf.getvalue()
 
-    if len(raw) > _MAX_BUNDLE_BYTES:
-        return {"error": f"Bundle is {len(raw) / 1e6:.1f} MB, over the 250 MB limit."}
+    if len(raw) > _MWAA_MAX_CODE_BYTES:
+        return {"error": f"Bundle is {len(raw) / 1e6:.1f} MB, over the MWAA Serverless "
+                         f"limit of {_MWAA_MAX_CODE_BYTES / 1e6:.0f} MB."}
 
+    oversized_for_transport = len(raw) > _MAX_INLINE_BUNDLE_BYTES
     callables = sorted(f"{mod}.{fn}" for mod, fns in modules.items() for fn in fns)
 
-    return {
+    result = {
         "bundle_name": bundle_name,
         "zip_base64": base64.b64encode(raw).decode("ascii"),
         "size_bytes": len(raw),
@@ -107,7 +129,30 @@ def build_code_bundle(files, bundle_name: str = "code.zip") -> dict:
         ),
         "worker_environment": CODE_SUPPORT["worker_environment"],
         "reminder": CODE_SUPPORT["no_internet_by_default"],
+        "size_limits": {
+            "this_bundle_bytes": len(raw),
+            "max_inline_bytes": _MAX_INLINE_BUNDLE_BYTES,
+            "max_inline_note": (
+                "Inline bundles travel base64-encoded inside the request. On the Lambda "
+                "deployment a request cannot exceed 6 MB, so the inline ceiling is well "
+                "below the MWAA quota. Running locally over stdio there is no such "
+                "transport, and the service quota is the only limit that applies."
+            ),
+            "mwaa_service_quota_bytes": _MWAA_MAX_CODE_BYTES,
+        },
     }
+
+    if oversized_for_transport:
+        result["transport_warning"] = (
+            f"This bundle is {len(raw) / 1e6:.1f} MB, which is within the MWAA Serverless "
+            f"quota of {_MWAA_MAX_CODE_BYTES / 1e6:.0f} MB but too large to pass INLINE to a "
+            f"remotely deployed server: base64 inflates it by a third and a Lambda request is "
+            f"capped at 6 MB, so the call will fail before it reaches MWAA. Upload the zip to "
+            f"S3 yourself and pass code_s3_key instead of code_zip_base64. Running locally over "
+            f"stdio this does not apply."
+        )
+
+    return result
 
 
 def _analyse_python(name: str, source: str) -> dict:
