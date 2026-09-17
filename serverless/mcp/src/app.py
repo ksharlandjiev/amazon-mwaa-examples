@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """MCP Server Lambda handler for the MWAA Serverless workflow assistant."""
 
 import json
@@ -11,7 +14,7 @@ import builder as _builder
 import codebundle as _codebundle
 import config as _config
 from tools import (
-    generate_yaml, validate_yaml, repair_yaml, list_operators, list_unsupported,
+    generate_yaml, validate_yaml, repair_yaml, list_operators,
     get_constraints, get_overview, get_dag_yaml_spec as _get_dag_yaml_spec,
     describe_operator as _describe_operator,
     generate_execution_role_policy,
@@ -217,7 +220,13 @@ def build_dag_yaml(dag_id: str, tasks: list, schedule: str = "", description: st
     """PREFERRED way to produce DAG YAML. Emits the schema MWAA Serverless accepts
     and validates the result, so the six mistakes that break hand-written YAML
     (list tasks, short operator names, a `parameters:` wrapper, `upstream_tasks`,
-    string durations, integer execution_timeout) cannot happen.
+    string durations, integer execution_timeout) cannot reach the output.
+
+    Nothing is changed silently. `values_adjusted` lists every value coerced, capped
+    or renamed on your behalf (a duration string parsed to seconds, a retry_delay
+    above the 300s maximum capped, `upstream_tasks` renamed to `dependencies`), and
+    `build_problems` holds anything that could not be interpreted — those are never
+    replaced with a plausible default.
 
     Each entry in `tasks`:
         task_id                    (required) unique id
@@ -225,7 +234,7 @@ def build_dag_yaml(dag_id: str, tasks: list, schedule: str = "", description: st
         params                     (optional) operator arguments as a mapping
         dependencies               (optional) list of upstream task_ids
         retries                    (optional) 0-3
-        retry_delay_seconds        (optional) 0-300
+        retry_delay_seconds        (optional) 0-300, or a duration like "90s"/"5m"
         execution_timeout_minutes  (optional) 1-60
         trigger_rule               (optional) e.g. "all_done" for a cleanup task,
                                    "one_failed" for a failure notification
@@ -317,7 +326,7 @@ def repair_dag_yaml(yaml_content: str) -> str:
 
 @mcp_server.tool()
 def preflight_dag_yaml(yaml_content: str, s3_bucket: str, execution_role_arn: str,
-                       code_zip_base64: str = "") -> str:
+                       code_zip_base64: str = "", expected_bucket_owner: str = "") -> str:
     """Have MWAA Serverless itself validate a definition, without leaving a workflow
     behind. The definitive correctness check before deployment.
 
@@ -326,30 +335,59 @@ def preflight_dag_yaml(yaml_content: str, s3_bucket: str, execution_role_arn: st
     silently drop), and deletes the throwaway. Catches things a local check cannot,
     such as an argument the installed provider version does not accept.
 
+    Side effects: writes and deletes two objects in s3_bucket, and briefly consumes
+    one of the 100 workflows-per-account quota slots. If cleanup fails, the response
+    names the leftover workflow and objects so you can remove them. The service also
+    creates a CloudWatch log group for the throwaway workflow that outlives it; it is
+    left behind empty and named in `log_group_residue`.
+
     Args:
         yaml_content: The DAG YAML to check
         s3_bucket: Bucket to stage the definition in
         execution_role_arn: Execution role ARN (only validated, never assumed)
         code_zip_base64: Optional code bundle, for DAGs with Python/Bash tasks
+        expected_bucket_owner: Your account id, to assert bucket ownership on write
     """
-    return _j(_preflight_definition(yaml_content, s3_bucket, execution_role_arn, code_zip_base64))
+    return _j(_preflight_definition(yaml_content, s3_bucket, execution_role_arn, code_zip_base64,
+                                    expected_bucket_owner))
 
 
 @mcp_server.tool()
-def generate_execution_role(yaml_content: str) -> str:
+def generate_execution_role(yaml_content: str, account_id: str = "", region: str = "",
+                            passable_role_arns: Optional[list] = None,
+                            include_destructive_actions: bool = True) -> str:
     """Produce an IAM execution role for a DAG: trust policy, permissions policy
     scoped to the API calls its operators actually make, and the CLI commands to
     create it.
 
-    Actions are least-privilege per operator rather than service wildcards.
+    NO statement uses Resource "*". Each grant is scoped to one service, in one
+    region, in one account, and the response tells you how to narrow it further to
+    individual job/table/queue ARNs. Pass account_id and region to get real ARNs;
+    omit them and the policy comes back with ${ACCOUNT_ID}/${REGION} placeholders and
+    a file-based apply sequence, so a wildcard policy can never be pasted by accident.
+
+    region also selects the ARN partition — a policy written with arn:aws matches
+    nothing in GovCloud or China, which shows up as tasks mysteriously losing
+    permissions rather than as an error.
+
+    Delete*/Terminate* actions go in their own Destructive* statement so you can
+    delete them outright when the DAG does not create the resources it operates on.
+
     iam:PassRole is added only when a task genuinely hands a role to another service,
-    and is constrained with iam:PassedToService. Resources are still "*" — the
-    response lists how to narrow them.
+    and is constrained both by iam:PassedToService and by role ARN. PassRole to
+    CloudFormation is withheld entirely unless you name the exact roles in
+    passable_role_arns: CloudFormation acts with whatever role it is given, so an
+    unscoped grant lets this role do anything any passable role in the account can do.
 
     Args:
         yaml_content: The DAG YAML to analyse
+        account_id: Your AWS account id. Omit for a placeholder policy.
+        region: Region the workflow runs in. Also selects the ARN partition.
+        passable_role_arns: Exact role ARNs the DAG's tasks pass to other services
+        include_destructive_actions: Set false for a DAG that only reads and runs jobs
     """
-    return _j(generate_execution_role_policy(yaml_content))
+    return _j(generate_execution_role_policy(yaml_content, account_id, region,
+                                             passable_role_arns, include_destructive_actions))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -414,17 +452,25 @@ def check_dag_code_consistency(yaml_content: str, files: Optional[dict] = None) 
 @mcp_server.tool()
 def generate_dag_yaml(dag_id: str, service: str, description: str = "",
                       schedule: str = "None", params: Optional[dict] = None) -> str:
-    """Generate a self-contained DEMO workflow for one AWS service, to try that
-    service out end to end.
+    """Generate a DEMO workflow for one AWS service, to try that service out end to end.
 
     These templates provision their own prerequisites with CloudFormation and tear
-    them down, so they run in an empty account. That also makes them a poor starting
-    point for a real pipeline — for that use plan_pipeline then build_dag_yaml, which
-    produces one task per operation the user actually asked for.
+    them down, which also makes them a poor starting point for a real pipeline — for
+    that use plan_pipeline then build_dag_yaml, which produces one task per operation
+    the user actually asked for.
 
-    Check `params_you_must_set` in the response: where a template previously read
-    CloudFormation stack outputs from XCom (which returns None and fails at run
-    time), the reference is now a param you must fill in.
+    CHECK `params_you_must_set` BEFORE DEPLOYING. Only about half the templates are
+    fully self-contained. The rest need an identifier the stack itself GENERATES (a
+    !Ref'd bucket name, a !GetAtt role ARN), which cannot be known before the stack
+    exists — CloudFormationCreateStackOperator returns None via XCom, so reading stack
+    Outputs from it fails at run time. Those references come back as params with
+    REPLACE_ME defaults. If `params_you_must_set` is non-empty and you deploy anyway,
+    the DAG provisions its stack, fails the work task on the placeholder, and tears the
+    stack back down.
+
+    Self-contained today (no params required): s3, lambda, bedrock, redshift, rds, dms,
+    neptune, glacier, appflow, quicksight, dynamodb, opensearch_serverless,
+    emr_serverless, eventbridge, cloudformation.
 
     Args:
         dag_id: Workflow/DAG identifier
@@ -490,9 +536,21 @@ def analyze_python_dag_tool(python_source: str) -> str:
 def convert_python_to_yaml_tool(python_source: str) -> str:
     """Convert a Python Airflow DAG to MWAA Serverless YAML.
 
-    Extracts tasks, operators, arguments and >> dependency chains via AST and emits
-    the mapping-shaped, fully-qualified YAML the service accepts. Always validate the
-    result with validate_dag_yaml and review anything listed as replaced or dropped.
+    Extracts tasks, operators, arguments and dependency chains (>>, <<, set_upstream,
+    set_downstream) via AST and emits the mapping-shaped, fully-qualified YAML the
+    service accepts. The source is only ever parsed, never executed.
+
+    CHECK `faithful` AND `dropped` BEFORE YOU DEPLOY. `valid` only means the YAML
+    matches the schema; `faithful: false` means the emitted DAG is NOT equivalent to
+    the Python you supplied, and every difference is itemised in `dropped` with the
+    source expression, why it could not be carried over, and what to do about it.
+
+    Things that land in `dropped` rather than disappearing: arguments whose value is a
+    variable, function call, f-string or comprehension (not knowable without running
+    the code); lists and dicts containing any of those; default_args keys the service
+    does not honour (depends_on_past, sla, email...); dependency edges whose endpoint
+    is a task built in a helper or a loop; duplicate task_ids; and a second DAG in the
+    same file — one file is one workflow, so only the first is converted.
 
     Args:
         python_source: The Python DAG source
@@ -508,9 +566,14 @@ def convert_python_to_yaml_tool(python_source: str) -> str:
 def mwaa_deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str,
                         execution_role_arn: str, s3_key: str = "",
                         code_zip_base64: str = "", code_s3_key: str = "",
-                        trigger_mode: str = "", start_run: bool = True) -> str:
+                        trigger_mode: str = "", start_run: bool = True,
+                        expected_bucket_owner: str = "") -> str:
     """Upload the definition (and code bundle, if any), create or update the
     workflow, and start a run.
+
+    MUTATING: if a workflow of this name already exists, its definition is UPDATED in
+    place, and unless start_run=false a billable run starts immediately. Check
+    mwaa_list_workflows first if you are unsure whether the name is taken.
 
     Validates locally first and refuses to deploy a broken definition. Surfaces the
     service's `Warnings` list, which is how MWAA Serverless reports attributes it
@@ -530,9 +593,12 @@ def mwaa_deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str,
         code_s3_key: Optional key for the code bundle, or point at an existing object
         trigger_mode: SCHEDULED | MANUAL | DISABLED
         start_run: Set false to deploy without starting a run
+        expected_bucket_owner: Your account id. Passed as ExpectedBucketOwner so the
+            upload fails instead of writing to a bucket you do not own.
     """
     return _j(_deploy_and_run(workflow_name, yaml_content, s3_bucket, execution_role_arn,
-                              s3_key, code_zip_base64, code_s3_key, trigger_mode, start_run))
+                              s3_key, code_zip_base64, code_s3_key, trigger_mode, start_run,
+                              expected_bucket_owner))
 
 
 @mcp_server.tool()
@@ -585,16 +651,29 @@ def mwaa_get_failed_runs(name_contains: str = "", hours_back: int = 24,
     """Scan workflows for recent failures, pull the CloudWatch task logs, and
     optionally get an AI root-cause analysis.
 
+    DATA FLOW — `analyze` DEFAULTS TO TRUE. When it is on, the collected failure
+    details INCLUDING CLOUDWATCH TASK LOG EXCERPTS (up to 12,000 characters) are sent
+    to Amazon Bedrock. Task logs routinely contain bucket names, ARNs, account ids,
+    table names and sometimes payload fragments. The default model is a cross-Region
+    inference profile (us.*), so that content may be processed in a different AWS
+    Region than your workflows. Pass analyze=false to keep everything local, or set
+    BEDROCK_REGION / pin a non-us.* BEDROCK_MODEL_ID to keep inference in-Region. The
+    log-based findings are complete and authoritative without the AI step.
+
     With include_hidden_failures (default), runs reported as SUCCESS are also
     inspected for tasks that actually failed — filtering on FAILED alone misses real
     breakage, because a trailing all_done task turns a failed run green.
 
+    If some workflows could not be read, the response carries `not_scanned` and
+    `incomplete_scan_warning` — an empty `failures` list with those present does NOT
+    mean everything is healthy.
+
     Args:
         name_contains: Only scan workflows matching this substring
         hours_back: How far back to look (default 24)
-        analyze: Include Bedrock root-cause analysis. The model is configurable —
-            see get_server_config. The response reports analysis_model, or
-            analysis_unavailable with the reason if no model could be invoked.
+        analyze: Send failure details and log excerpts to Bedrock for root-cause
+            analysis. DEFAULT TRUE. The model is configurable — see get_server_config.
+            The response reports analysis_model, or analysis_unavailable with the reason.
         include_hidden_failures: Also inspect SUCCESS runs for failed tasks
     """
     return _j(_get_failed_runs_summary(name_contains, hours_back, analyze, include_hidden_failures))
@@ -705,17 +784,26 @@ def mwaa_find_workflows_by_service(service: str) -> str:
 
 
 @mcp_server.tool()
-def mwaa_redeploy(workflow_name: str, yaml_content: str, s3_bucket: str = "", s3_key: str = "") -> str:
+def mwaa_redeploy(workflow_name: str, yaml_content: str, s3_bucket: str = "", s3_key: str = "",
+                  expected_bucket_owner: str = "") -> str:
     """Update an existing workflow's YAML and start a new run, reusing its existing
     S3 location and execution role.
 
+    DESTRUCTIVE: this OVERWRITES the deployed definition and the S3 object behind it,
+    then starts a billable run. workflow_name must be the EXACT name — a partial match
+    is refused, because overwriting the wrong workflow's definition is unrecoverable.
+    The new YAML is validated locally first and the workflow is left untouched if it
+    fails.
+
     Args:
-        workflow_name: Existing workflow name (exact or partial)
+        workflow_name: Existing workflow name (EXACT)
         yaml_content: New DAG YAML
         s3_bucket: Optional bucket override
         s3_key: Optional key override
+        expected_bucket_owner: Your account id, to assert bucket ownership on write
     """
-    return _j(_redeploy_workflow(workflow_name, yaml_content, s3_bucket, s3_key))
+    return _j(_redeploy_workflow(workflow_name, yaml_content, s3_bucket, s3_key,
+                                 expected_bucket_owner))
 
 
 @mcp_server.tool()
@@ -730,18 +818,28 @@ def mwaa_compare_versions(workflow_name: str) -> str:
 
 @mcp_server.tool()
 def mwaa_delete_workflows(name_contains: str = "", not_run_in_days: int = 0,
-                          dry_run: bool = True) -> str:
+                          dry_run: bool = True, confirm_delete_all: bool = False) -> str:
     """Delete workflows by name pattern or inactivity. Previews by default.
 
-    Deletion is irreversible and removes all versions. Show the dry-run result and
-    get explicit confirmation before calling again with dry_run=false.
+    READ THIS BEFORE CALLING. With NO name_contains and NO not_run_in_days, this
+    targets EVERY workflow in the account and Region — including workflows this
+    server never created. Always pass a filter.
+
+    Deletion is irreversible and removes all versions. An unfiltered call with
+    dry_run=false is REFUSED and returns the list it would have deleted; deleting
+    everything requires confirm_delete_all=true, which you should only pass after the
+    user has seen that list and asked for it explicitly.
+
+    Show the dry-run result and get explicit confirmation before calling again with
+    dry_run=false.
 
     Args:
         name_contains: Delete workflows whose name contains this substring
         not_run_in_days: Delete workflows not run in this many days (0 = ignore)
         dry_run: True (default) previews. False actually deletes.
+        confirm_delete_all: Required to delete with no filter at all
     """
-    return _j(_delete_workflows(name_contains, not_run_in_days, dry_run))
+    return _j(_delete_workflows(name_contains, not_run_in_days, dry_run, confirm_delete_all))
 
 
 def handler(event, context):

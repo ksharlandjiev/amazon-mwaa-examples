@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """Run this MCP server locally over stdio, with no network exposure.
 
 The Lambda + HTTP API deployment puts a public endpoint on the internet. Running
@@ -33,12 +36,12 @@ try:
 except ImportError:
     try:
         from mcp.server.fastmcp import FastMCP as _Server
-    except ImportError:  # pragma: no cover
+    except ImportError as exc:  # pragma: no cover
         sys.stderr.write(
             "The 'mcp' package is required for local stdio mode.\n"
             "Install it with:  pip install -r requirements-local.txt\n"
         )
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -107,6 +110,28 @@ def _wrap_tool_errors(fn, name):
     return wrapper
 
 
+def _tool_registry():
+    """The (spec, implementation) registries app.py's handler populates.
+
+    These are INTERNAL attributes of awslabs.mcp_lambda_handler, not a documented API.
+    Reading them is what keeps the Lambda and stdio transports exposing identical
+    tools from one definition — but it means a minor version bump can remove them.
+    Fail here with an actionable message rather than registering zero tools and
+    presenting an empty, apparently-working server.
+    """
+    missing = [attr for attr in ("tools", "tool_implementations")
+               if not hasattr(app.mcp_server, attr)]
+    if missing:
+        raise RuntimeError(
+            f"This version of awslabs.mcp_lambda_handler no longer exposes "
+            f"{', '.join(missing)} on MCPLambdaHandler, which local stdio mode reads to "
+            f"mirror the Lambda transport's tools. Pin the version in "
+            f"src/requirements.txt (see the ~=0.1.15 constraint there), or register the "
+            f"tools on the stdio server explicitly."
+        )
+    return app.mcp_server.tools, app.mcp_server.tool_implementations
+
+
 def build_server():
     """Register every tool from app.py's registry onto a local stdio server.
 
@@ -116,9 +141,10 @@ def build_server():
     still derived from the same signature the Lambda path uses.
     """
     server = _Server("mwaa-serverless-mcp")
+    specs, implementations = _tool_registry()
     registered, skipped = 0, []
-    for name, spec in app.mcp_server.tools.items():
-        fn = app.mcp_server.tool_implementations.get(name)
+    for name, spec in specs.items():
+        fn = implementations.get(name)
         if fn is None:
             skipped.append(name)
             continue
@@ -130,6 +156,11 @@ def build_server():
         registered += 1
     if skipped:
         log.warning("Skipped tools with no implementation: %s", ", ".join(skipped))
+    if not registered:
+        raise RuntimeError(
+            "No tools were registered. app.py's tool registry was readable but empty, "
+            "which means the @mcp_server.tool() decorators did not run."
+        )
     log.info("Registered %d tools for local stdio transport", registered)
     return server
 
