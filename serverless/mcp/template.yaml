@@ -1,32 +1,96 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: MCP Server for MWAA Serverless workflow authoring, validation and operations
 
+# ─────────────────────────────────────────────────────────────────────────────
+# READ THIS BEFORE DEPLOYING
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # TRANSPORT: a Lambda Function URL with IAM authentication. There is no API Gateway.
-#
-# Why: API Gateway added no value here. It fronted a single POST/GET/DELETE route with
-# no authorizer, which meant anyone who learned the URL could invoke every tool using
-# THIS FUNCTION'S permissions — CreateWorkflow, UpdateWorkflow, DeleteWorkflow,
-# iam:PassRole and S3 read/write. AWS::Serverless::HttpApi also cannot express IAM
-# authorization at all (Auth.DefaultAuthorizer: AWS_IAM is a REST API feature and SAM
-# rejects it on an HTTP API), so securing it meant changing transport regardless.
-#
 # AuthType: AWS_IAM means callers must SigV4-sign with credentials that hold
-# lambda:InvokeFunctionUrl on this function. Verified: unsigned requests get
-# 403 Forbidden, SigV4-signed requests (signing service "lambda") get 200.
-#
-# Clients cannot sign by themselves. Use the AWS-maintained signing proxy:
-#   uvx mcp-proxy-for-aws@latest <FunctionUrl>
-#
-# For individual use, prefer NOT deploying this at all: src/local_server.py runs the
-# same tools over stdio as a child process of your MCP client, with no endpoint to
-# expose and AWS calls made under your own credentials. See README.md.
+# lambda:InvokeFunctionUrl on this function. Verified: unsigned requests get 403,
+# SigV4-signed requests (signing service "lambda") get 200. Clients cannot sign by
+# themselves — use the AWS-maintained signing proxy:
+#     uvx mcp-proxy-for-aws@latest <FunctionUrl>
 #
 # No CORS block: browsers cannot SigV4-sign, so a browser origin cannot reach an
 # IAM-authenticated Function URL. Adding CORS would only imply otherwise.
 #
-# Still worth tightening: the Policies below use Resource "*". Scope them to the
-# workflows and buckets you use, and drop DeleteWorkflow if the server never deletes.
+# ⚠ PRIVILEGE ESCALATION — understand this before you deploy:
+#
+# This function holds airflow-serverless:CreateWorkflow, s3:PutObject and
+# iam:PassRole. It also exposes tools that build a code bundle and deploy a workflow
+# containing PythonOperator/BashOperator tasks. Composed, that means ANYONE WHO CAN
+# INVOKE THIS FUNCTION URL CAN RUN ARBITRARY CODE under any role that is passable to
+# airflow-serverless.amazonaws.com — including roles far more privileged than this
+# function itself. That is a lateral-movement primitive, not merely "broad permissions".
+#
+# Mitigate it by narrowing the parameters below:
+#   WorkflowBucketName        restricts S3 read/write to one bucket
+#   PassableExecutionRolePath restricts iam:PassRole to a role-name prefix
+#   AllowWorkflowDeletion     removes DeleteWorkflow entirely
+# and by granting lambda:InvokeFunctionUrl to a single dedicated principal rather
+# than relying on everyone-who-is-an-admin.
+#
+# SEPARATELY — a DATA-FLOW decision, not a blast-radius one: EnableFailureAnalysis
+# defaults to true, which grants bedrock:InvokeModel so mwaa_get_failed_runs works out
+# of the box. That tool sends CloudWatch task log excerpts to Bedrock, potentially
+# cross-Region. Set it to false, or keep inference in-Region with BEDROCK_REGION, if
+# your logs are sensitive or you have data-residency obligations. See README.md.
+#
+# For individual use, prefer NOT deploying this at all: src/local_server.py runs the
+# same tools over stdio as a child process of your MCP client, with no endpoint to
+# expose and AWS calls made under your own credentials. See README.md.
+
+Parameters:
+  WorkflowBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Bucket the server may read and write workflow definitions and code bundles in.
+      STRONGLY RECOMMENDED. Leave empty and S3 access falls back to every bucket in
+      the account, which lets an authorized caller overwrite arbitrary objects.
+  PassableExecutionRolePath:
+    Type: String
+    Default: 'mwaa-serverless-*'
+    Description: >-
+      Role-name pattern this function may pass to airflow-serverless. Keep it as
+      narrow as possible; '*' would allow passing any role in the account, including
+      an AdministratorAccess role, to a workflow that runs your code.
+  AllowWorkflowDeletion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether the server may call DeleteWorkflow. Default false — the delete tool is
+      the only irreversible operation here, so it is opt-in.
+  EnableFailureAnalysis:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether the server may call Bedrock for AI root-cause analysis. Default true, so
+      mwaa_get_failed_runs works out of the box. BE AWARE OF THE DATA FLOW: it sends
+      CloudWatch TASK LOG EXCERPTS (up to 12,000 characters) to Bedrock, and the default
+      model chain leads with cross-Region inference profiles (us.*), so that content may
+      be processed outside this Region. Task logs routinely carry bucket names, ARNs,
+      account ids and table names. Set this to false to remove bedrock:InvokeModel
+      entirely — the log-based findings are complete and authoritative without it. To keep
+      the feature but keep inference in-Region, leave this true and set BEDROCK_REGION or
+      pin a non-us.* BEDROCK_MODEL_ID.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch retention for this function's own logs. 0 = never expire.
+
+Conditions:
+  ScopeToOneBucket: !Not [!Equals [!Ref WorkflowBucketName, '']]
+  DeletionAllowed: !Equals [!Ref AllowWorkflowDeletion, 'true']
+  AnalysisEnabled: !Equals [!Ref EnableFailureAnalysis, 'true']
+  RetainLogsForever: !Equals [!Ref LogRetentionDays, 0]
 
 Globals:
   Function:
@@ -36,6 +100,7 @@ Globals:
     Timeout: 120
     Runtime: python3.12
     MemorySize: 512
+    Tracing: Active
 
 Resources:
   McpFunction:
@@ -43,48 +108,98 @@ Resources:
     Properties:
       Handler: app.handler
       CodeUri: src/
+      # One MCP client does not need concurrency, and a cap bounds both the blast
+      # radius of a runaway caller and the bill.
+      ReservedConcurrentExecutions: 5
       FunctionUrlConfig:
         AuthType: AWS_IAM
         InvokeMode: BUFFERED
       Policies:
         - Statement:
-            - Effect: Allow
+            # ── Collection-level operations ──────────────────────────────────
+            # These CANNOT be scoped to a resource ARN and must use "*":
+            #   ListWorkflows    enumerates the account; there is no per-item ARN
+            #   CreateWorkflow   the workflow does not exist yet, so there is
+            #                    nothing to name. Verified with
+            #                    iam:SimulatePrincipalPolicy — scoped to
+            #                    workflow/* it evaluates to implicitDeny, which
+            #                    made every name-resolving tool fail with
+            #                    AccessDeniedException at run time.
+            #   DescribeLogGroups  same: it enumerates, it does not read one group.
+            # All three are read-or-create only. Nothing destructive uses "*".
+            - Sid: CollectionLevelOperations
+              Effect: Allow
               Action:
                 - airflow-serverless:ListWorkflows
-                - airflow-serverless:GetWorkflow
                 - airflow-serverless:CreateWorkflow
-                - airflow-serverless:UpdateWorkflow
-                - airflow-serverless:DeleteWorkflow
-                - airflow-serverless:StartWorkflowRun
+                - logs:DescribeLogGroups
+              Resource: '*'
+            # ── Everything below is scoped to a resource ARN ─────────────────
+            - Sid: WorkflowRead
+              Effect: Allow
+              Action:
+                - airflow-serverless:GetWorkflow
                 - airflow-serverless:GetWorkflowRun
                 - airflow-serverless:ListWorkflowRuns
                 - airflow-serverless:ListWorkflowVersions
+              Resource: !Sub 'arn:${AWS::Partition}:airflow-serverless:${AWS::Region}:${AWS::AccountId}:workflow/*'
+            - Sid: WorkflowWrite
+              Effect: Allow
+              Action:
+                - airflow-serverless:UpdateWorkflow
+                - airflow-serverless:StartWorkflowRun
                 - airflow-serverless:StopWorkflowRun
-              Resource: "*"
-            - Effect: Allow
+              Resource: !Sub 'arn:${AWS::Partition}:airflow-serverless:${AWS::Region}:${AWS::AccountId}:workflow/*'
+            - !If
+              - DeletionAllowed
+              - Sid: WorkflowDelete
+                Effect: Allow
+                Action: airflow-serverless:DeleteWorkflow
+                Resource: !Sub 'arn:${AWS::Partition}:airflow-serverless:${AWS::Region}:${AWS::AccountId}:workflow/*'
+              - !Ref AWS::NoValue
+            # DeleteObject is used to clean up the throwaway definition that
+            # preflight_dag_yaml stages so the service can validate it.
+            - Sid: WorkflowArtifactObjects
+              Effect: Allow
               Action:
                 - s3:GetObject
                 - s3:PutObject
-                # DeleteObject is used to clean up the throwaway definition that
-                # preflight_dag_yaml stages so the service can validate it.
                 - s3:DeleteObject
+              Resource: !If
+                - ScopeToOneBucket
+                - !Sub 'arn:${AWS::Partition}:s3:::${WorkflowBucketName}/*'
+                - !Sub 'arn:${AWS::Partition}:s3:::*/*'
+            - Sid: WorkflowArtifactBucket
+              Effect: Allow
+              Action:
                 - s3:ListBucket
                 - s3:GetBucketLocation
-              Resource: "*"
-            - Effect: Allow
+              Resource: !If
+                - ScopeToOneBucket
+                - !Sub 'arn:${AWS::Partition}:s3:::${WorkflowBucketName}'
+                - !Sub 'arn:${AWS::Partition}:s3:::*'
+            - !If
+              - AnalysisEnabled
+              - Sid: FailureAnalysis
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+              - !Ref AWS::NoValue
+            - Sid: ReadWorkflowTaskLogs
+              Effect: Allow
               Action:
-                - bedrock:InvokeModel
-              Resource: "*"
-            - Effect: Allow
-              Action:
-                - logs:DescribeLogGroups
                 - logs:DescribeLogStreams
                 - logs:GetLogEvents
-              Resource: "*"
-            - Effect: Allow
-              Action:
-                - iam:PassRole
-              Resource: "*"
+              Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/mwaa-serverless/*'
+            # Scoped by BOTH the receiving service and the role name. The
+            # iam:PassedToService condition alone constrains only which service gets
+            # the role, not which role can be passed.
+            - Sid: PassWorkflowExecutionRole
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${PassableExecutionRolePath}'
               Condition:
                 StringEquals:
                   iam:PassedToService: airflow-serverless.amazonaws.com
@@ -96,6 +211,14 @@ Resources:
           # reaching end of life previously disabled this feature silently).
           # BEDROCK_MODEL_ID: us.anthropic.claude-haiku-4-5-20251001-v1:0
 
+  # Declared explicitly so retention is set. An implicitly created Lambda log group
+  # never expires, which quietly accrues storage cost forever.
+  McpFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${McpFunction}'
+      RetentionInDays: !If [RetainLogsForever, !Ref 'AWS::NoValue', !Ref LogRetentionDays]
+
 Outputs:
   McpFunctionUrl:
     Description: >-
@@ -106,5 +229,13 @@ Outputs:
     Description: MCP Server Function ARN
     Value: !GetAtt McpFunction.Arn
   InvokePolicyHint:
-    Description: IAM permission a caller needs to reach this endpoint
+    Description: >-
+      IAM permission a caller needs to reach this endpoint. Attach it to ONE dedicated
+      principal rather than relying on broad administrator access.
     Value: !Sub '{"Effect":"Allow","Action":"lambda:InvokeFunctionUrl","Resource":"${McpFunction.Arn}"}'
+  S3AccessScope:
+    Description: How broadly this function can read and write S3
+    Value: !If
+      - ScopeToOneBucket
+      - !Sub 'Scoped to s3://${WorkflowBucketName}'
+      - 'UNSCOPED — every bucket in this account. Redeploy with WorkflowBucketName set.'

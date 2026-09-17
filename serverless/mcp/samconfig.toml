@@ -1,4 +1,19 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# NOTE ON REGION: `region` below is a DEFAULT, not a recommendation. It must be a
+# Region where MWAA Serverless is available and where your workflows live. Change it
+# here or override per command with `sam deploy --region <your-region>`; otherwise a
+# plain `sam deploy` silently targets us-east-1.
+#
+# NOTE ON PARAMETERS: parameter_overrides below is where you scope the function's
+# permissions down. Set WorkflowBucketName to the bucket you use — leaving it empty
+# grants S3 read/write across every bucket in the account. See template.yaml.
+
 version = 0.1
+
+[default.global.parameters]
+region = "us-east-1"
 
 [default.deploy.parameters]
 stack_name = "mwaa-serverless-mcp"
@@ -7,6 +22,10 @@ s3_prefix = "mwaa-serverless-mcp"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 image_repositories = []
-
-[default.global.parameters]
-region = "us-east-1"
+# Uncomment and fill in before deploying anything you care about:
+# parameter_overrides = [
+#   "WorkflowBucketName=my-mwaa-workflow-bucket",
+#   "PassableExecutionRolePath=mwaa-serverless-*",
+#   "AllowWorkflowDeletion=false",
+#   "EnableFailureAnalysis=true",   # false = no bedrock:InvokeModel; see README data-flow note
+# ]
