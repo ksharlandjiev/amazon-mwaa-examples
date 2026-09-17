@@ -1,0 +1,62 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# CI for serverless/mcp only. Path-scoped on purpose: the other directories in this
+# repository have their own conventions and are not covered by this sample's linters,
+# so running these checks repository-wide would report failures that are not defects.
+#
+# Nothing here touches AWS. The test suite uses stub clients, and cfn-lint reads the
+# template statically, so this workflow needs no credentials and no OIDC role.
+
+name: serverless/mcp
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'serverless/mcp/**'
+      - '.github/workflows/serverless-mcp.yml'
+  pull_request:
+    paths:
+      - 'serverless/mcp/**'
+      - '.github/workflows/serverless-mcp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: serverless/mcp
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Matches the Lambda runtime in template.yaml and ruff's target-version.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/requirements-local.txt
+          pip install pytest ruff cfn-lint bandit
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Unit tests (pytest)
+        run: python -m pytest
+
+      - name: Template lint (cfn-lint)
+        run: cfn-lint template.yaml
+
+      # Fails the build on any finding. The sample is expected to stay at zero rather
+      # than carry a baseline of accepted ones.
+      - name: Static security scan (bandit)
+        run: bandit -r src/
