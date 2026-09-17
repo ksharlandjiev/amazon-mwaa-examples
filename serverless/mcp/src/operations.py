@@ -1,17 +1,49 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """Operational functions for MWAA Serverless workflow management."""
 
+import base64
 import json
+import logging
 import re
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+
 import boto3
 import yaml
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+log = logging.getLogger(__name__)
 
 _client = None
 
 # Terminal run states. Note SUCCESS here means "the run finished", NOT "every task
 # succeeded" — verify_run_tasks() exists because those are different things.
 TERMINAL_RUN_STATES = {"SUCCESS", "FAILED", "STOPPED", "TIMEOUT"}
+
+# Objects written to the caller's bucket are encrypted with SSE-S3 by default. A
+# sample must not write unencrypted objects, and the header is free.
+_SSE_ALGORITHM = "AES256"
+
+# Guard on the code bundle before it is decoded: base64 inflates by 4/3, and this
+# function has 512 MB of memory, so an oversized payload is a cheap way to OOM it.
+_MAX_CODE_ZIP_BYTES = 250 * 1024 * 1024
+
+
+def _put_object(s3, bucket, key, body, expected_bucket_owner=""):
+    """Write to S3 with encryption and, when known, an owner assertion.
+
+    ExpectedBucketOwner is the standard confused-deputy guard: without it, a caller
+    who can reach this function can direct it to write into any bucket the execution
+    role happens to have access to.
+    """
+    kwargs = {"Bucket": bucket, "Key": key, "Body": body,
+              "ServerSideEncryption": _SSE_ALGORITHM}
+    if expected_bucket_owner:
+        kwargs["ExpectedBucketOwner"] = expected_bucket_owner
+    return s3.put_object(**kwargs)
 
 # Upper bound for a single poll call, kept below the Lambda timeout (120s in
 # template.yaml) so the function returns the current status instead of being killed.
@@ -106,7 +138,8 @@ def _failed_tasks_in_run(workflow_arn: str, run_id: str, limit: int = 20) -> lis
             logStreamNamePrefix=f"workflow_id={wf_id}/run_id={run_id}/",
             limit=limit,
         ).get("logStreams", [])
-    except Exception:
+    except Exception as e:  # noqa: BLE001 - logged; caller sees an empty list
+        log.warning("Could not list log streams for run %s in %s: %s", run_id, log_group, e)
         return out
 
     for stream in streams:
@@ -118,13 +151,16 @@ def _failed_tasks_in_run(workflow_arn: str, run_id: str, limit: int = 20) -> lis
             events = logs_client.get_log_events(
                 logGroupName=log_group, logStreamName=sname, limit=200, startFromHead=False
             ).get("events", [])
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - logged; this stream is skipped
+            log.warning("Could not read log stream %s: %s", sname, e)
             continue
         state, err = None, None
         for ev in events:
             try:
                 p = json.loads(ev.get("message", ""))
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
+                # Airflow also emits plain-text lines; only the JSON ones carry
+                # final_state, so a non-JSON line is expected and not an error.
                 continue
             if "final_state" in p:
                 state = p.get("final_state")
@@ -147,6 +183,80 @@ def _log_group_for(workflow_arn: str) -> str:
     """
     wf_id = workflow_arn.rsplit("/", 1)[-1] if "/" in workflow_arn else workflow_arn
     return f"/aws/mwaa-serverless/{wf_id}/"
+
+
+def _list_all_workflows(client=None) -> list:
+    """Every workflow in the account, following pagination.
+
+    Only the list_workflows tool used a paginator before; every name-resolution path
+    called the single-page API, so past one page a workflow that exists reported as
+    "No workflow found matching X" — intermittently, depending on where it landed.
+    """
+    client = client or _get_client()
+    workflows = []
+    try:
+        paginator = client.get_paginator("list_workflows")
+    except Exception:  # noqa: BLE001 - older botocore may not model the paginator
+        log.debug("list_workflows has no paginator in this botocore; using NextToken manually")
+        paginator = None
+
+    if paginator is not None:
+        for page in paginator.paginate():
+            workflows.extend(page.get("Workflows", []))
+        return workflows
+
+    token = None
+    while True:
+        kwargs = {"NextToken": token} if token else {}
+        resp = client.list_workflows(**kwargs)
+        workflows.extend(resp.get("Workflows", []))
+        token = resp.get("NextToken")
+        if not token:
+            return workflows
+
+
+def _match_workflows(all_wf, workflow_name):
+    """(exact_matches, partial_matches) for a name."""
+    exact = [w for w in all_wf if w.get("Name", "") == workflow_name]
+    lowered = workflow_name.lower()
+    partial = [w for w in all_wf
+               if lowered in w.get("Name", "").lower() and w.get("Name", "") != workflow_name]
+    return exact, partial
+
+
+def _resolve_workflow_arn(workflow_name: str, require_unambiguous: bool = False) -> tuple:
+    """Resolve a workflow name to (arn, name, all_workflows).
+
+    Returns (None, error_message, None) on failure.
+
+    require_unambiguous=True is used by every MUTATING caller. Previously a partial
+    match silently took match[0], so `stop_run("prod")` could kill the wrong
+    workflow's run and `redeploy("prod")` could overwrite the wrong definition.
+    """
+    all_wf = _list_all_workflows()
+    exact, partial = _match_workflows(all_wf, workflow_name)
+
+    if exact:
+        return exact[0]["WorkflowArn"], exact[0].get("Name", ""), all_wf
+
+    if not partial:
+        near = sorted(w.get("Name", "") for w in all_wf)[:10]
+        hint = f" Existing workflows: {', '.join(near)}." if near else ""
+        return None, f"No workflow found matching '{workflow_name}'.{hint}", None
+
+    if len(partial) > 1 or require_unambiguous:
+        names = sorted(w.get("Name", "") for w in partial)
+        if len(partial) == 1 and require_unambiguous:
+            return None, (
+                f"'{workflow_name}' is not an exact workflow name. The only partial match is "
+                f"'{names[0]}'. This operation modifies a workflow, so pass the exact name."
+            ), None
+        return None, (
+            f"'{workflow_name}' matches {len(partial)} workflows: {', '.join(names)}. "
+            f"Pass the exact name."
+        ), None
+
+    return partial[0]["WorkflowArn"], partial[0].get("Name", ""), all_wf
 
 
 def _iter_tasks(dag):
@@ -181,22 +291,8 @@ def _iter_tasks(dag):
 
 def list_workflows(name_contains: str = "", status: str = "") -> dict:
     """List all workflows, optionally filtered by name substring or status."""
-    client = _get_client()
-    workflows = []
-    paginator = client.get_paginator("list_workflows") if hasattr(client, "get_paginator") else None
+    workflows = _list_all_workflows()
 
-    if paginator:
-        try:
-            for page in paginator.paginate():
-                workflows.extend(page.get("Workflows", []))
-        except Exception:
-            resp = client.list_workflows()
-            workflows = resp.get("Workflows", [])
-    else:
-        resp = client.list_workflows()
-        workflows = resp.get("Workflows", [])
-
-    # Filter
     if name_contains:
         name_lower = name_contains.lower()
         workflows = [w for w in workflows if name_lower in w.get("Name", "").lower()]
@@ -204,16 +300,13 @@ def list_workflows(name_contains: str = "", status: str = "") -> dict:
         status_upper = status.upper()
         workflows = [w for w in workflows if w.get("WorkflowStatus", "").upper() == status_upper]
 
-    # Compact output
-    result = []
-    for w in workflows:
-        result.append({
-            "name": w.get("Name", ""),
-            "status": w.get("WorkflowStatus", ""),
-            "trigger_mode": w.get("TriggerMode", ""),
-            "arn": w.get("WorkflowArn", ""),
-            "modified": w.get("ModifiedAt", ""),
-        })
+    result = [{
+        "name": w.get("Name", ""),
+        "status": w.get("WorkflowStatus", ""),
+        "trigger_mode": w.get("TriggerMode", ""),
+        "arn": w.get("WorkflowArn", ""),
+        "modified": w.get("ModifiedAt", ""),
+    } for w in workflows]
 
     return {"count": len(result), "workflows": result}
 
@@ -222,17 +315,9 @@ def get_workflow(workflow_name: str) -> dict:
     """Get detailed info about a workflow including its DAG YAML definition."""
     client = _get_client()
 
-    # Find the workflow ARN by name
-    all_wf = client.list_workflows().get("Workflows", [])
-    match = [w for w in all_wf if w.get("Name", "") == workflow_name]
-    if not match:
-        # Try partial match
-        match = [w for w in all_wf if workflow_name.lower() in w.get("Name", "").lower()]
-    if not match:
-        return {"error": f"No workflow found matching '{workflow_name}'"}
-
-    wf = match[0]
-    arn = wf["WorkflowArn"]
+    arn, name, _ = _resolve_workflow_arn(workflow_name)
+    if arn is None:
+        return {"error": name}
     detail = client.get_workflow(WorkflowArn=arn)
 
     info = {
@@ -284,8 +369,8 @@ def get_workflow(workflow_name: str) -> dict:
                 if op:
                     operators.add(op)
             info["operators_used"] = sorted(operators)
-        except Exception:
-            pass
+        except yaml.YAMLError as e:
+            info["operators_used_error"] = f"deployed definition does not parse: {e}"
         try:
             import validator
             v = validator.validate(yaml_content)
@@ -293,8 +378,9 @@ def get_workflow(workflow_name: str) -> dict:
                 info["definition_validation_errors"] = v["errors"]
             if v["warnings"]:
                 info["definition_validation_warnings"] = v["warnings"]
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - reported, not swallowed
+            log.warning("Could not validate the deployed definition for %s: %s", name, e)
+            info["definition_validation_error"] = f"validation could not run: {e}"
 
     return info
 
@@ -303,71 +389,103 @@ def start_workflow_run(workflow_name: str) -> dict:
     """Start a workflow run by name."""
     client = _get_client()
 
-    all_wf = client.list_workflows().get("Workflows", [])
-    match = [w for w in all_wf if w.get("Name", "") == workflow_name]
-    if not match:
-        match = [w for w in all_wf if workflow_name.lower() in w.get("Name", "").lower()]
-    if not match:
-        return {"error": f"No workflow found matching '{workflow_name}'"}
+    # Mutating (it costs money and can double-run a pipeline), so require an
+    # unambiguous name rather than silently taking the first substring match.
+    arn, name, _ = _resolve_workflow_arn(workflow_name, require_unambiguous=True)
+    if arn is None:
+        return {"error": name}
 
-    arn = match[0]["WorkflowArn"]
     resp = client.start_workflow_run(WorkflowArn=arn)
 
     return {
-        "workflow_name": match[0].get("Name", ""),
+        "workflow_name": name,
         "workflow_arn": arn,
         "run_id": resp.get("RunId", resp.get("WorkflowRunId", "")),
         "status": "STARTED",
     }
 
 
+def _attempt_number(attempt) -> int:
+    """Attempt as an int for ordering. Log stream names carry it as a string."""
+    try:
+        return int(str(attempt).strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_timestamp(value):
+    """Parse an ISO-ish timestamp into an aware datetime, or None.
+
+    boto3 returns datetimes, but these paths stringify them first, and a run whose
+    timestamp cannot be parsed must not be silently treated as old.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _sort_runs_newest_first(runs):
+    return sorted(
+        runs,
+        key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", r.get("StartedAt", ""))),
+        reverse=True,
+    )
+
+
+def _latest_run_id(client, arn, statuses=None):
+    """(run_id, error). Newest run, optionally restricted to certain statuses."""
+    try:
+        runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller
+        log.warning("list_workflow_runs failed for %s: %s", arn, e)
+        return None, f"Failed to list runs: {e}"
+    if statuses:
+        runs = [r for r in runs
+                if r.get("RunDetailSummary", {}).get("Status", "") in statuses]
+    if not runs:
+        return None, None
+    return _sort_runs_newest_first(runs)[0].get("RunId", ""), None
+
+
 def get_workflow_run_status(workflow_name: str, run_id: str = "") -> dict:
     """Get the status of a workflow run. If no run_id, gets the latest run."""
     client = _get_client()
 
-    all_wf = client.list_workflows().get("Workflows", [])
-    match = [w for w in all_wf if w.get("Name", "") == workflow_name]
-    if not match:
-        match = [w for w in all_wf if workflow_name.lower() in w.get("Name", "").lower()]
-    if not match:
-        return {"error": f"No workflow found matching '{workflow_name}'"}
-
-    arn = match[0]["WorkflowArn"]
+    arn, name, _ = _resolve_workflow_arn(workflow_name)
+    if arn is None:
+        return {"error": name}
 
     if not run_id:
-        # Get latest run
-        try:
-            runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
-            if not runs:
-                return {"workflow_name": match[0].get("Name", ""), "message": "No runs found"}
-            # Sort by created time descending
-            runs.sort(
-                key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", r.get("StartedAt", ""))),
-                reverse=True,
-            )
-            run_id = runs[0].get("RunId", "")
-        except Exception as e:
-            return {"error": f"Failed to list runs: {str(e)}"}
+        run_id, err = _latest_run_id(client, arn)
+        if err:
+            return {"error": err}
+        if not run_id:
+            return {"workflow_name": name, "message": "No runs found"}
 
     try:
         run = client.get_workflow_run(WorkflowArn=arn, RunId=run_id)
-    except Exception as e:
-        return {"error": f"Failed to get run: {str(e)}"}
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller
+        return {"error": f"Failed to get run: {e}"}
 
     detail = run.get("RunDetail", {})
     result = {
-        "workflow_name": match[0].get("Name", ""),
+        "workflow_name": name,
         "run_id": run_id,
         "status": detail.get("RunState", run.get("Status", "")),
         "started_at": str(detail.get("CreatedAt", run.get("StartedAt", ""))),
         "ended_at": str(detail.get("ModifiedAt", run.get("EndedAt", ""))),
     }
 
-    # Include error message if present
     if detail.get("ErrorMessage"):
         result["error_message"] = detail["ErrorMessage"]
 
-    # Include task details if available
     tasks = detail.get("TaskInstances", [])
     if tasks:
         if isinstance(tasks[0], str):
@@ -383,7 +501,6 @@ def get_workflow_run_status(workflow_name: str, run_id: str = "") -> dict:
                     task_info["error"] = t.get("Error", t.get("ErrorMessage", ""))
                 result["tasks"].append(task_info)
 
-    # Include failure reason if failed
     if run.get("FailureReason"):
         result["failure_reason"] = run["FailureReason"]
 
@@ -394,40 +511,26 @@ def stop_workflow_run(workflow_name: str, run_id: str = "") -> dict:
     """Stop a running workflow. If no run_id, stops the latest active run."""
     client = _get_client()
 
-    all_wf = client.list_workflows().get("Workflows", [])
-    match = [w for w in all_wf if w.get("Name", "") == workflow_name]
-    if not match:
-        match = [w for w in all_wf if workflow_name.lower() in w.get("Name", "").lower()]
-    if not match:
-        return {"error": f"No workflow found matching '{workflow_name}'"}
-
-    arn = match[0]["WorkflowArn"]
+    # Mutating: an exact name is required so a substring cannot kill another
+    # workflow's run.
+    arn, name, _ = _resolve_workflow_arn(workflow_name, require_unambiguous=True)
+    if arn is None:
+        return {"error": name}
 
     if not run_id:
-        try:
-            runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
-            active = [
-                r for r in runs
-                if r.get("RunDetailSummary", {}).get("Status", "") in ("RUNNING", "STARTING", "QUEUED")
-            ]
-            if not active:
-                return {"message": "No active runs to stop"}
-            active.sort(
-                key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", "")),
-                reverse=True,
-            )
-            run_id = active[0].get("RunId", "")
-        except Exception as e:
-            return {"error": f"Failed to list runs: {str(e)}"}
+        run_id, err = _latest_run_id(client, arn,
+                                     statuses=("RUNNING", "STARTING", "QUEUED"))
+        if err:
+            return {"error": err}
+        if not run_id:
+            return {"workflow_name": name, "message": "No active runs to stop"}
 
     client.stop_workflow_run(WorkflowArn=arn, RunId=run_id)
-    return {"workflow_name": match[0].get("Name", ""), "run_id": run_id, "status": "STOPPING"}
+    return {"workflow_name": name, "run_id": run_id, "status": "STOPPING"}
 
 
 def find_workflows_using_service(service_keyword: str) -> dict:
     """Find workflows that use operators for a specific AWS service by inspecting DAG YAML definitions."""
-    client = _get_client()
-
     # Map common service names to operator substrings (short names + FQN fragments)
     service_map = {
         "step_functions": ["StepFunction", "step_function"],
@@ -463,54 +566,60 @@ def find_workflows_using_service(service_keyword: str) -> dict:
     }
 
     keywords = service_map.get(service_keyword.lower(), [service_keyword])
-    all_wf = client.list_workflows().get("Workflows", [])
+    all_wf = _list_all_workflows()
 
     def _inspect(wf):
+        arn = wf.get("WorkflowArn", "")
         try:
-            arn = wf["WorkflowArn"]
             detail = _new_client().get_workflow(WorkflowArn=arn)
-            s3_loc = detail.get("DefinitionS3Location", {})
-            if not s3_loc:
-                return None
-            obj = boto3.client("s3").get_object(Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
-            dag = yaml.safe_load(obj["Body"].read().decode("utf-8"))
+            # Prefer the immutable snapshot; fall back to S3 only if it is absent.
+            text = detail.get("WorkflowDefinition")
+            if not text:
+                s3_loc = detail.get("DefinitionS3Location", {})
+                if not s3_loc:
+                    return None, None
+                obj = boto3.client("s3").get_object(
+                    Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
+                text = obj["Body"].read().decode("utf-8")
+            dag = yaml.safe_load(text)
             found = [
                 {"task_id": t.get("task_id", ""), "operator": t.get("operator", "")}
                 for t in _iter_tasks(dag)
                 if any(kw.lower() in t.get("operator", "").lower() for kw in keywords)
             ]
             if found:
-                return {"name": wf.get("Name", ""), "arn": arn, "matching_tasks": found}
-        except Exception:
-            pass
-        return None
+                return {"name": wf.get("Name", ""), "arn": arn, "matching_tasks": found}, None
+        except Exception as e:  # noqa: BLE001 - reported, never swallowed
+            log.warning("Could not inspect workflow %s: %s", wf.get("Name", arn), e)
+            return None, f"{wf.get('Name', arn)}: {e}"
+        return None, None
 
-    matches = []
+    matches, errors = [], []
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(_inspect, wf): wf for wf in all_wf}
         for f in as_completed(futures):
-            result = f.result()
+            result, err = f.result()
             if result:
                 matches.append(result)
+            if err:
+                errors.append(err)
 
-    return {"service": service_keyword, "count": len(matches), "workflows": matches}
-
-
-def _resolve_workflow_arn(workflow_name: str) -> tuple:
-    """Resolve a workflow name to (arn, name, all_workflows). Returns (None, error_msg, None) on failure."""
-    client = _get_client()
-    all_wf = client.list_workflows().get("Workflows", [])
-    match = [w for w in all_wf if w.get("Name", "") == workflow_name]
-    if not match:
-        match = [w for w in all_wf if workflow_name.lower() in w.get("Name", "").lower()]
-    if not match:
-        return None, f"No workflow found matching '{workflow_name}'", None
-    return match[0]["WorkflowArn"], match[0].get("Name", ""), all_wf
+    out = {"service": service_keyword, "workflows_scanned": len(all_wf),
+           "count": len(matches), "workflows": matches}
+    if errors:
+        # Without this, a permissions problem was indistinguishable from "no matches".
+        out["not_inspected"] = errors
+        out["incomplete_scan_warning"] = (
+            f"{len(errors)} of {len(all_wf)} workflow(s) could not be read, so this result may "
+            f"be missing matches. Fix the errors in not_inspected and re-run."
+        )
+    return out
 
 
 def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execution_role_arn: str,
                    s3_key: str = "", code_zip_base64: str = "", code_s3_key: str = "",
-                   trigger_mode: str = "", start_run: bool = True) -> dict:
+                   trigger_mode: str = "", start_run: bool = True,
+                   expected_bucket_owner: str = "") -> dict:
     """Upload the definition (and optional code bundle) to S3, create or update the
     workflow, and start a run.
 
@@ -526,22 +635,23 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
 
     # Validate before touching AWS — a bad definition is rejected anyway, and the
     # local error message is far more actionable than the service's.
+    pre = None
     try:
         import validator
         pre = validator.validate(yaml_content)
-        if not pre["valid"]:
-            return {
-                "error": "Definition failed local validation; nothing was deployed.",
-                "validation_errors": pre["errors"],
-                "hint": "Call repair_dag_yaml to fix the mechanical problems, then redeploy.",
-            }
-    except Exception:
-        pre = None
+    except Exception as e:  # noqa: BLE001 - a validator failure must not block deploy
+        log.warning("Local validation could not run: %s", e)
+    if pre and not pre["valid"]:
+        return {
+            "error": "Definition failed local validation; nothing was deployed.",
+            "validation_errors": pre["errors"],
+            "hint": "Call repair_dag_yaml to fix the mechanical problems, then redeploy.",
+        }
 
     try:
-        s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=yaml_content.encode("utf-8"))
-    except Exception as e:
-        return {"error": f"S3 upload of the definition failed: {str(e)}"}
+        _put_object(s3, s3_bucket, s3_key, yaml_content.encode("utf-8"), expected_bucket_owner)
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller
+        return {"error": f"S3 upload of the definition failed: {e}"}
 
     s3_loc = {"Bucket": s3_bucket, "ObjectKey": s3_key}
 
@@ -551,16 +661,20 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
         if not _supports_code_param():
             return {"error": "This runtime's botocore does not support the CreateWorkflow `Code` "
                              "parameter. Upgrade boto3 to >= 1.40 to deploy Python/Bash tasks."}
-        import base64
+        # Check the encoded length BEFORE decoding: base64 expands by 4/3, and this
+        # function has 512 MB, so decoding first is an easy way to OOM it.
+        if len(code_zip_base64) > _MAX_CODE_ZIP_BYTES * 4 // 3:
+            return {"error": f"code_zip_base64 decodes to more than "
+                             f"{_MAX_CODE_ZIP_BYTES // (1024 * 1024)} MB, over the code bundle limit."}
         try:
-            blob = base64.b64decode(code_zip_base64)
-        except Exception as e:
+            blob = base64.b64decode(code_zip_base64, validate=True)
+        except Exception as e:  # noqa: BLE001 - surfaced to the caller
             return {"error": f"code_zip_base64 is not valid base64: {e}"}
         ckey = code_s3_key or f"workflows/code/{workflow_name}.zip"
         try:
-            s3.put_object(Bucket=s3_bucket, Key=ckey, Body=blob)
-        except Exception as e:
-            return {"error": f"S3 upload of the code bundle failed: {str(e)}"}
+            _put_object(s3, s3_bucket, ckey, blob, expected_bucket_owner)
+        except Exception as e:  # noqa: BLE001 - surfaced to the caller
+            return {"error": f"S3 upload of the code bundle failed: {e}"}
         code_arg = {"Code": {"S3Location": {"Bucket": s3_bucket, "ObjectKey": ckey}}}
     elif code_s3_key:
         code_arg = {"Code": {"S3Location": {"Bucket": s3_bucket, "ObjectKey": code_s3_key}}}
@@ -581,7 +695,7 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
         warnings = resp.get("Warnings") or []
         action = "created"
     except client.exceptions.ConflictException:
-        all_wf = client.list_workflows().get("Workflows", [])
+        all_wf = _list_all_workflows(client)
         existing = [w for w in all_wf if w.get("Name", "") == workflow_name]
         if not existing:
             return {"error": f"Workflow '{workflow_name}' conflict but not found in list"}
@@ -638,15 +752,23 @@ def deploy_and_run(workflow_name: str, yaml_content: str, s3_bucket: str, execut
 
 
 def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: str,
-                         code_zip_base64: str = "") -> dict:
+                         code_zip_base64: str = "", expected_bucket_owner: str = "") -> dict:
     """Have MWAA Serverless itself validate a definition, then clean up.
 
     Creates a throwaway workflow to exercise the service's own validator, reports
     the verdict (including the Warnings list), and deletes it again. This catches
     anything the local validator cannot know about — such as an operator argument
     the installed provider version does not accept.
+
+    Side effects the caller should know about: it writes (and deletes) two objects in
+    s3_bucket, and it consumes one of the 100 workflows-per-account quota slots for
+    the duration. If the delete fails, `cleanup` says so and names the leftover.
+    One residue is NOT cleaned up: MWAA Serverless creates a CloudWatch log group
+    for the throwaway workflow, and that log group outlives the workflow. It is left
+    behind empty (0 bytes, no streams, no retention policy), so it costs nothing to
+    store, but it accumulates one group per preflight call. `log_group_residue` in
+    the result names it so you can delete it if you care.
     """
-    import uuid
     import validator
 
     local = validator.validate(yaml_content)
@@ -661,23 +783,29 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
     s3 = boto3.client("s3")
     probe = f"preflight-{uuid.uuid4().hex[:8]}"
     key = f"preflight/{probe}.yaml"
+    ckey = None
     arn = None
     try:
-        s3.put_object(Bucket=s3_bucket, Key=key, Body=yaml_content.encode("utf-8"))
-    except Exception as e:
+        _put_object(s3, s3_bucket, key, yaml_content.encode("utf-8"), expected_bucket_owner)
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller
         out["service_validation"] = f"skipped — S3 upload failed: {e}"
         out["valid"] = local["valid"]
         return out
 
     extra = {}
     if code_zip_base64 and _supports_code_param():
-        import base64
         ckey = f"preflight/{probe}.zip"
         try:
-            s3.put_object(Bucket=s3_bucket, Key=ckey, Body=base64.b64decode(code_zip_base64))
+            _put_object(s3, s3_bucket, ckey, base64.b64decode(code_zip_base64, validate=True),
+                        expected_bucket_owner)
             extra["Code"] = {"S3Location": {"Bucket": s3_bucket, "ObjectKey": ckey}}
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - reported, never swallowed
+            log.warning("Preflight code bundle upload failed: %s", e)
+            ckey = None
+            out["code_bundle_warning"] = (
+                f"The code bundle could not be staged ({e}), so the service validated the "
+                f"definition WITHOUT it. Python/Bash tasks were not checked."
+            )
 
     try:
         resp = client.create_workflow(
@@ -690,26 +818,42 @@ def preflight_definition(yaml_content: str, s3_bucket: str, execution_role_arn: 
         out["service_validation"] = "accepted"
         out["service_warnings"] = resp.get("Warnings") or []
         out["valid"] = True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - the rejection IS the result here
         msg = str(e)
         out["service_validation"] = "rejected"
         out["service_error"] = msg.split("Workflow validation failed:")[-1].strip() or msg
         out["valid"] = False
     finally:
         if arn:
+            out["log_group_residue"] = _log_group_for(arn)
             try:
                 client.delete_workflow(WorkflowArn=arn)
                 out["cleanup"] = "throwaway workflow deleted"
-            except Exception as e:
-                out["cleanup"] = f"could not delete throwaway workflow {arn}: {e}"
-        try:
-            s3.delete_object(Bucket=s3_bucket, Key=key)
-        except Exception:
-            pass
+            except Exception as e:  # noqa: BLE001 - reported so the leftover is visible
+                log.warning("Could not delete preflight workflow %s: %s", arn, e)
+                out["cleanup"] = (
+                    f"could not delete throwaway workflow {arn}: {e}. Delete it manually — it "
+                    f"counts against the 100-workflow quota."
+                )
+        leftovers = []
+        for stale_key in [k for k in (key, ckey) if k]:
+            try:
+                s3.delete_object(Bucket=s3_bucket, Key=stale_key)
+            except Exception as e:  # noqa: BLE001 - reported so the leftover is visible
+                log.warning("Could not delete preflight object %s: %s", stale_key, e)
+                leftovers.append(f"s3://{s3_bucket}/{stale_key} ({e})")
+        if leftovers:
+            out["cleanup_s3"] = f"could not delete: {', '.join(leftovers)}"
 
     if out.get("service_warnings"):
         out["service_warnings_note"] = (
             "The service will silently drop these attributes. Remove them from the definition."
+        )
+    if out.get("log_group_residue"):
+        out["log_group_residue_note"] = (
+            "MWAA Serverless created this log group for the throwaway workflow and it outlives "
+            "the workflow. It is empty and costs nothing to store; delete it if you do not want "
+            "one log group per preflight call."
         )
     return out
 
@@ -743,7 +887,6 @@ def poll_workflow_run(workflow_name: str, run_id: str = "", max_seconds: int = 0
         except Exception as e:
             return {"error": f"Failed to list runs: {str(e)}"}
 
-    terminal_states = {"SUCCESS", "FAILED", "STOPPED", "TIMEOUT"}
     start_time = time.time()
     poll_interval = 3
     last_status = {}
@@ -791,6 +934,45 @@ def poll_workflow_run(workflow_name: str, run_id: str = "", max_seconds: int = 0
     return last_status
 
 
+# Operators that run no code on a worker, so MWAA Serverless creates NO CloudWatch log
+# stream for them. Verified end to end: a DAG of EmptyOperator -> BashOperator ->
+# EmptyOperator produced exactly one stream (the Bash task). Treating a missing stream
+# as "not flushed yet" therefore reported a perfectly healthy run as incomplete forever.
+_NO_LOG_STREAM_OPERATORS = {"EmptyOperator"}
+
+
+def _tasks_without_log_streams(client, arn) -> set:
+    """Declared tasks that legitimately never write a log stream.
+
+    Read from the workflow's immutable definition snapshot. Returns an empty set if the
+    definition cannot be read — better to report a task as indeterminate than to claim
+    it succeeded on the strength of a failed lookup.
+    """
+    try:
+        detail = client.get_workflow(WorkflowArn=arn)
+        text = detail.get("WorkflowDefinition")
+        if not text:
+            return set()
+        data = yaml.safe_load(text)
+    except Exception as e:  # noqa: BLE001 - logged; falls back to "assume it logs"
+        log.warning("Could not read the definition for %s to identify no-log tasks: %s", arn, e)
+        return set()
+
+    from schema import resolve_operator_fqn
+    silent = set()
+    for dag_cfg in (data or {}).values():
+        tasks = (dag_cfg or {}).get("tasks")
+        if not isinstance(tasks, dict):
+            continue
+        for tid, tcfg in tasks.items():
+            if not isinstance(tcfg, dict):
+                continue
+            _, short, _ = resolve_operator_fqn(tcfg.get("operator", "") or "")
+            if short in _NO_LOG_STREAM_OPERATORS:
+                silent.add(tid)
+    return silent
+
+
 def verify_run_tasks(workflow_name: str, run_id: str = "", include_logs: bool = True,
                      max_error_lines: int = 8, wait_for_logs_seconds: int = 45) -> dict:
     """Determine each task's real outcome by reading its CloudWatch log stream.
@@ -831,12 +1013,14 @@ def verify_run_tasks(workflow_name: str, run_id: str = "", include_logs: bool = 
         return {"error": f"get_workflow_run failed: {str(e)}"}
 
     run_is_terminal = reported_state in TERMINAL_RUN_STATES
+    silent_tasks = _tasks_without_log_streams(client, arn)
     deadline = time.time() + max(0, int(wait_for_logs_seconds))
     attempts = 0
 
     while True:
         attempts += 1
-        outcome = _read_task_outcomes(arn, run_id, declared_tasks, include_logs, max_error_lines)
+        outcome = _read_task_outcomes(arn, run_id, declared_tasks, include_logs,
+                                      max_error_lines, silent_tasks)
         if "reason" in outcome:
             # Log group absent. Only worth waiting if the run has finished.
             if run_is_terminal and time.time() < deadline:
@@ -871,7 +1055,15 @@ def verify_run_tasks(workflow_name: str, run_id: str = "", include_logs: bool = 
             f"an upstream failure. Treat this run as a failure and fix the failing task(s)."
         )
     elif result["all_tasks_succeeded"]:
-        result["conclusion"] = "Every task completed successfully."
+        note = "Every task completed successfully."
+        if result.get("no_log_stream_expected"):
+            note += (
+                f" {len(result['no_log_stream_expected'])} task(s) "
+                f"({', '.join(result['no_log_stream_expected'])}) write no log stream at all "
+                f"because their operator runs no code on a worker — that is expected, not a "
+                f"missing result."
+            )
+        result["conclusion"] = note
     elif result["unknown"] or result["no_logs_yet"]:
         result["conclusion"] = (
             f"No task failed, but {len(result['unknown']) + len(result['no_logs_yet'])} task(s) "
@@ -883,7 +1075,8 @@ def verify_run_tasks(workflow_name: str, run_id: str = "", include_logs: bool = 
     return result
 
 
-def _read_task_outcomes(arn, run_id, declared_tasks, include_logs, max_error_lines):
+def _read_task_outcomes(arn, run_id, declared_tasks, include_logs, max_error_lines,
+                        silent_tasks=frozenset()):
     """One pass over a run's task log streams. Returns the outcome dict, or
     {"reason": ...} when the log group does not exist yet."""
     logs_client = boto3.client("logs")
@@ -966,18 +1159,25 @@ def _read_task_outcomes(arn, run_id, declared_tasks, include_logs, max_error_lin
 
         outcome["errors"] = outcome["errors"][:max_error_lines]
         prev = task_results.get(task_id)
-        # Keep the highest attempt, which is the final outcome after retries.
-        if prev is None or (attempt or "0") >= (prev.get("attempt") or "0"):
+        # Keep the highest attempt, which is the final outcome after retries. Compared
+        # as INTEGERS: a string compare made attempt "10" lose to "9", so past ten
+        # attempts the reported outcome was the wrong one.
+        if prev is None or _attempt_number(attempt) >= _attempt_number(prev.get("attempt")):
             task_results[task_id] = outcome
 
     failed = sorted(t["task_id"] for t in task_results.values() if t["final_state"] == "failed")
     succeeded = sorted(t["task_id"] for t in task_results.values() if t["final_state"] == "success")
     unknown = sorted(t["task_id"] for t in task_results.values()
                      if t["final_state"] not in ("failed", "success"))
-    missing = sorted(t for t in declared_tasks if t not in task_results)
+    # Split the streamless tasks into "expected to have none" and "genuinely missing".
+    absent = [t for t in declared_tasks if t not in task_results]
+    no_stream_expected = sorted(t for t in absent if t in silent_tasks)
+    missing = sorted(t for t in absent if t not in silent_tasks)
 
     return {
-        "all_tasks_succeeded": bool(succeeded) and not failed and not unknown and not missing,
+        "all_tasks_succeeded": bool(succeeded or no_stream_expected) and not failed
+                               and not unknown and not missing,
+        "no_log_stream_expected": no_stream_expected,
         "task_count": len(task_results),
         "succeeded": succeeded,
         "failed": failed,
@@ -1048,10 +1248,11 @@ def _get_task_error_logs(workflow_arn: str, run_id: str, max_lines: int = 5) -> 
                         "task_id": task_id,
                         "errors": error_lines[:max_lines],
                     })
-            except Exception:
+            except Exception as e:  # noqa: BLE001 - logged; this stream is skipped
+                log.warning("Could not read log stream %s: %s", stream_name, e)
                 continue
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - logged; caller sees no task logs
+        log.warning("Could not collect task error logs for run %s: %s", run_id, e)
 
     return task_logs
 
@@ -1065,13 +1266,10 @@ def get_failed_runs_summary(name_contains: str = "", hours_back: int = 24, analy
     reports SUCCESS even when an earlier task raised, so filtering on
     RunState == FAILED alone silently misses real breakage.
     """
-    client = _get_client()
-    from datetime import datetime, timezone, timedelta
-
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
     # Get workflows
-    all_wf = client.list_workflows().get("Workflows", [])
+    all_wf = _list_all_workflows()
     if name_contains:
         name_lower = name_contains.lower()
         all_wf = [w for w in all_wf if name_lower in w.get("Name", "").lower()]
@@ -1089,11 +1287,11 @@ def get_failed_runs_summary(name_contains: str = "", hours_back: int = 24, analy
                 status = summary.get("Status")
                 created = summary.get("CreatedOn", "")
                 if created:
-                    try:
-                        if datetime.fromisoformat(str(created)) < cutoff:
-                            continue
-                    except ValueError:
-                        pass
+                    parsed = _parse_timestamp(created)
+                    # A run whose timestamp cannot be parsed is INSPECTED rather than
+                    # skipped: skipping it would hide a failure on a formatting quirk.
+                    if parsed is not None and parsed < cutoff:
+                        continue
                 run_id = r.get("RunId", "")
 
                 if status == "FAILED":
@@ -1138,19 +1336,23 @@ def get_failed_runs_summary(name_contains: str = "", hours_back: int = 24, analy
             if hidden:
                 out["runs_reporting_success_with_failed_tasks"] = hidden
             if out:
-                return {"name": wf.get("Name", ""), "arn": arn, **out}
-        except Exception:
-            pass
-        return None
+                return {"name": wf.get("Name", ""), "arn": arn, **out}, None
+        except Exception as e:  # noqa: BLE001 - reported, never swallowed
+            log.warning("Failure scan failed for %s: %s", wf.get("Name", ""), e)
+            return None, f"{wf.get('Name', '')}: {e}"
+        return None, None
 
     # Parallel scan
     failed_workflows = []
+    scan_errors = []
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(_check_workflow, wf): wf for wf in all_wf}
         for f in as_completed(futures):
-            result = f.result()
+            result, err = f.result()
             if result:
                 failed_workflows.append(result)
+            if err:
+                scan_errors.append(err)
 
     # Bedrock analysis
     ai_analysis, ai_model, ai_error = None, None, None
@@ -1175,9 +1377,20 @@ def get_failed_runs_summary(name_contains: str = "", hours_back: int = 24, analy
         "workflows_with_failures": len(failed_workflows),
         "failures": failed_workflows,
     }
+    if scan_errors:
+        # A scan that could not read some workflows must not report "no failures".
+        result["not_scanned"] = scan_errors
+        result["incomplete_scan_warning"] = (
+            f"{len(scan_errors)} of {len(all_wf)} workflow(s) could not be scanned, so a real "
+            f"failure may be missing from this result. Fix the errors in not_scanned and re-run."
+        )
     if ai_analysis:
         result["analysis"] = ai_analysis
         result["analysis_model"] = ai_model
+        result["analysis_data_sent_to_bedrock"] = (
+            "Failure details INCLUDING CloudWatch task log excerpts were sent to Amazon Bedrock "
+            "for this analysis. Pass analyze=false to keep log content local."
+        )
     elif ai_error:
         # Do not bury this in an "analysis" string that reads like a finding — the
         # caller needs to know the AI step did not run, and why.
@@ -1256,13 +1469,37 @@ def _analyse_with_bedrock(prompt: str, max_tokens: int = None):
     )
 
 
-def delete_workflows(name_contains: str = "", not_run_in_days: int = 0, dry_run: bool = True) -> dict:
-    """Delete workflows matching criteria. Supports filtering by name and by inactivity period.
-    Always does a dry run first unless dry_run=False."""
-    client = _get_client()
-    from datetime import datetime, timezone, timedelta
+def delete_workflows(name_contains: str = "", not_run_in_days: int = 0, dry_run: bool = True,
+                     confirm_delete_all: bool = False) -> dict:
+    """Delete workflows matching criteria. Previews by default.
 
-    all_wf = client.list_workflows().get("Workflows", [])
+    REFUSES an unfiltered non-dry-run call. With no name_contains and no
+    not_run_in_days, the target set is EVERY workflow in the account — including ones
+    this server never created — and dry_run=True was the only thing standing between a
+    mis-parameterised call and account-wide deletion. Deleting everything is still
+    possible, but it now has to be asked for explicitly via confirm_delete_all.
+    """
+    client = _get_client()
+
+    all_wf = _list_all_workflows(client)
+    total_in_account = len(all_wf)
+    unfiltered = not name_contains and not_run_in_days <= 0
+
+    if unfiltered and not dry_run and not confirm_delete_all:
+        return {
+            "error": "Refusing to delete every workflow in the account.",
+            "reason": (
+                f"No filter was given, so this call targets all {total_in_account} workflow(s) "
+                f"in this account and Region, including workflows this server did not create. "
+                f"Deletion cannot be undone."
+            ),
+            "workflows_that_would_be_deleted": sorted(w.get("Name", "") for w in all_wf),
+            "how_to_proceed": [
+                "Pass name_contains='<substring>' to target a specific set (recommended), or",
+                "pass not_run_in_days=N to target only stale workflows, or",
+                "if you really do mean all of them, pass confirm_delete_all=true.",
+            ],
+        }
 
     # Filter by name
     if name_contains:
@@ -1273,32 +1510,45 @@ def delete_workflows(name_contains: str = "", not_run_in_days: int = 0, dry_run:
     if not_run_in_days > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(days=not_run_in_days)
         inactive = []
+        check_errors = []
 
         def _check_inactive(wf):
+            arn = wf["WorkflowArn"]
             try:
                 wf_client = _new_client()
-                arn = wf["WorkflowArn"]
                 runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
                 if not runs:
                     # Never run — include it
-                    return wf
+                    return wf, None
                 latest = max(
                     str(r.get("RunDetailSummary", {}).get("CreatedOn", ""))
                     for r in runs
                 )
-                if latest and datetime.fromisoformat(latest) < cutoff:
-                    return wf
-            except Exception:
-                pass
-            return None
+                if latest and _parse_timestamp(latest) and _parse_timestamp(latest) < cutoff:
+                    return wf, None
+            except Exception as e:  # noqa: BLE001 - reported, never swallowed
+                log.warning("Inactivity check failed for %s: %s", wf.get("Name", arn), e)
+                # A workflow whose run history could not be read must NOT be treated as
+                # inactive: that would delete it on the strength of a failed API call.
+                return None, f"{wf.get('Name', arn)}: {e}"
+            return None, None
 
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(_check_inactive, wf): wf for wf in all_wf}
             for f in as_completed(futures):
-                result = f.result()
-                if result:
-                    inactive.append(result)
+                wf, err = f.result()
+                if wf:
+                    inactive.append(wf)
+                if err:
+                    check_errors.append(err)
         all_wf = inactive
+        if check_errors:
+            return {
+                "error": "Could not determine last-run time for every candidate, so nothing "
+                         "was selected for deletion.",
+                "failed_checks": check_errors,
+                "hint": "Fix the permissions/errors above and retry, or delete by name instead.",
+            }
 
     targets = [{"name": w.get("Name", ""), "arn": w["WorkflowArn"]} for w in all_wf]
 
@@ -1306,6 +1556,16 @@ def delete_workflows(name_contains: str = "", not_run_in_days: int = 0, dry_run:
         return {
             "dry_run": True,
             "count": len(targets),
+            "total_workflows_in_account": total_in_account,
+            "filter_applied": None if unfiltered else {
+                "name_contains": name_contains or None,
+                "not_run_in_days": not_run_in_days or None,
+            },
+            "unfiltered_warning": (
+                f"NO FILTER was applied, so this targets all {total_in_account} workflow(s) in "
+                f"the account. A non-dry-run call will be refused unless you pass "
+                f"confirm_delete_all=true."
+            ) if unfiltered else None,
             "workflows_to_delete": targets,
             "message": "Set dry_run=false to actually delete these workflows.",
         }
@@ -1316,22 +1576,26 @@ def delete_workflows(name_contains: str = "", not_run_in_days: int = 0, dry_run:
         try:
             client.delete_workflow(WorkflowArn=t["arn"])
             results.append({"name": t["name"], "status": "deleted"})
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - per-workflow outcome is reported
+            log.warning("delete_workflow failed for %s: %s", t["name"], e)
             results.append({"name": t["name"], "status": "error", "error": str(e)})
 
-    return {"dry_run": False, "count": len(results), "results": results}
+    return {
+        "dry_run": False,
+        "count": len(results),
+        "deleted": sum(1 for r in results if r["status"] == "deleted"),
+        "failed": sum(1 for r in results if r["status"] == "error"),
+        "results": results,
+    }
 
 
 def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) -> dict:
     """List workflow runs with optional filters. Can filter by workflow name, run status, and time window."""
-    client = _get_client()
-    from datetime import datetime, timezone, timedelta
-
     cutoff = None
     if hours_back > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
-    all_wf = client.list_workflows().get("Workflows", [])
+    all_wf = _list_all_workflows()
     if name_contains:
         name_lower = name_contains.lower()
         all_wf = [w for w in all_wf if name_lower in w.get("Name", "").lower()]
@@ -1339,9 +1603,9 @@ def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) ->
     status_upper = status.upper() if status else ""
 
     def _get_runs(wf):
+        arn = wf.get("WorkflowArn", "")
         try:
             wf_client = _new_client()
-            arn = wf["WorkflowArn"]
             runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
             matched = []
             for r in runs:
@@ -1352,11 +1616,11 @@ def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) ->
                 if status_upper and run_status.upper() != status_upper:
                     continue
                 if cutoff and created:
-                    try:
-                        if datetime.fromisoformat(str(created)) < cutoff:
-                            continue
-                    except Exception:
-                        pass
+                    parsed = _parse_timestamp(created)
+                    # An unparseable timestamp is KEPT rather than dropped: excluding it
+                    # would hide a run because its date could not be read.
+                    if parsed is not None and parsed < cutoff:
+                        continue
 
                 matched.append({
                     "run_id": r.get("RunId", ""),
@@ -1366,18 +1630,21 @@ def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) ->
                     "ended": str(summary.get("EndedAt", "")),
                 })
             if matched:
-                return {"name": wf.get("Name", ""), "runs": matched}
-        except Exception:
-            pass
-        return None
+                return {"name": wf.get("Name", ""), "runs": matched}, None
+        except Exception as e:  # noqa: BLE001 - reported, never swallowed
+            log.warning("Could not list runs for %s: %s", wf.get("Name", arn), e)
+            return None, f"{wf.get('Name', arn)}: {e}"
+        return None, None
 
-    all_runs = []
+    all_runs, errors = [], []
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(_get_runs, wf): wf for wf in all_wf}
         for f in as_completed(futures):
-            result = f.result()
+            result, err = f.result()
             if result:
                 all_runs.append(result)
+            if err:
+                errors.append(err)
 
     # Summary counts
     total_runs = sum(len(w["runs"]) for w in all_runs)
@@ -1387,12 +1654,20 @@ def list_runs(name_contains: str = "", status: str = "", hours_back: int = 0) ->
             s = r["status"]
             status_counts[s] = status_counts.get(s, 0) + 1
 
-    return {
+    out = {
+        "workflows_scanned": len(all_wf),
         "workflows_with_runs": len(all_runs),
         "total_runs": total_runs,
         "status_summary": status_counts,
         "workflows": all_runs,
     }
+    if errors:
+        out["not_scanned"] = errors
+        out["incomplete_scan_warning"] = (
+            f"{len(errors)} of {len(all_wf)} workflow(s) could not be read; runs are missing "
+            f"from this result."
+        )
+    return out
 
 
 def get_workflow_summary(workflow_name: str) -> dict:
@@ -1414,14 +1689,23 @@ def get_workflow_summary(workflow_name: str) -> dict:
         "execution_role_arn": detail.get("RoleArn", ""),
     }
 
-    # Get operator count from S3
+    # Operator counts come from the immutable snapshot when available; the S3 object
+    # may have been overwritten since deployment.
+    text = detail.get("WorkflowDefinition")
     s3_loc = detail.get("DefinitionS3Location", {})
     if s3_loc:
         info["definition_s3"] = f"s3://{s3_loc.get('Bucket','')}/{s3_loc.get('ObjectKey','')}"
+    if not text and s3_loc:
         try:
-            s3 = boto3.client("s3")
-            obj = s3.get_object(Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
-            dag = yaml.safe_load(obj["Body"].read().decode("utf-8"))
+            obj = boto3.client("s3").get_object(
+                Bucket=s3_loc["Bucket"], Key=s3_loc["ObjectKey"])
+            text = obj["Body"].read().decode("utf-8")
+        except Exception as e:  # noqa: BLE001 - reported, never swallowed
+            log.warning("Could not read definition for %s: %s", name, e)
+            info["definition_read_error"] = str(e)
+    if text:
+        try:
+            dag = yaml.safe_load(text)
             operators = {}
             for t in _iter_tasks(dag):
                 op = t.get("operator", "")
@@ -1430,17 +1714,14 @@ def get_workflow_summary(workflow_name: str) -> dict:
                     operators[short] = operators.get(short, 0) + 1
             info["task_count"] = sum(operators.values())
             info["operators"] = operators
-        except Exception:
-            pass
+        except yaml.YAMLError as e:
+            info["definition_parse_error"] = str(e)
 
     # Get latest run status
     try:
         runs = client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
         if runs:
-            runs.sort(
-                key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", "")),
-                reverse=True,
-            )
+            runs = _sort_runs_newest_first(runs)
             latest = runs[0]
             summary = latest.get("RunDetailSummary", {})
             info["latest_run"] = {
@@ -1455,17 +1736,16 @@ def get_workflow_summary(workflow_name: str) -> dict:
                 status_counts[s] = status_counts.get(s, 0) + 1
             info["run_history"] = status_counts
             info["total_runs"] = len(runs)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported, never swallowed
+        log.warning("Could not read run history for %s: %s", name, e)
+        info["run_history_error"] = str(e)
 
     return info
 
 
 def bulk_status(name_contains: str = "", names: list = None) -> dict:
     """Get status of multiple workflows with their latest run in one call."""
-    client = _get_client()
-
-    all_wf = client.list_workflows().get("Workflows", [])
+    all_wf = _list_all_workflows()
 
     if names:
         names_lower = [n.lower() for n in names]
@@ -1475,17 +1755,13 @@ def bulk_status(name_contains: str = "", names: list = None) -> dict:
         all_wf = [w for w in all_wf if name_lower in w.get("Name", "").lower()]
 
     def _get_status(wf):
+        arn = wf.get("WorkflowArn", "")
         try:
             wf_client = _new_client()
-            arn = wf["WorkflowArn"]
             info = {"name": wf.get("Name", ""), "workflow_status": wf.get("WorkflowStatus", "")}
             runs = wf_client.list_workflow_runs(WorkflowArn=arn).get("WorkflowRuns", [])
             if runs:
-                runs.sort(
-                    key=lambda r: str(r.get("RunDetailSummary", {}).get("CreatedOn", "")),
-                    reverse=True,
-                )
-                s = runs[0].get("RunDetailSummary", {})
+                s = _sort_runs_newest_first(runs)[0].get("RunDetailSummary", {})
                 info["latest_run"] = {
                     "status": s.get("Status", ""),
                     "created": str(s.get("CreatedOn", "")),
@@ -1493,8 +1769,9 @@ def bulk_status(name_contains: str = "", names: list = None) -> dict:
             else:
                 info["latest_run"] = None
             return info
-        except Exception:
-            return {"name": wf.get("Name", ""), "error": "Failed to get status"}
+        except Exception as e:  # noqa: BLE001 - the real reason is reported, not hidden
+            log.warning("bulk_status failed for %s: %s", wf.get("Name", arn), e)
+            return {"name": wf.get("Name", ""), "error": f"Failed to get status: {e}"}
 
     results = []
     with ThreadPoolExecutor(max_workers=10) as pool:
@@ -1505,14 +1782,35 @@ def bulk_status(name_contains: str = "", names: list = None) -> dict:
     # Sort by name
     results.sort(key=lambda r: r.get("name", ""))
 
-    return {"count": len(results), "workflows": results}
+    failed = [r["name"] for r in results if r.get("error")]
+    out = {"count": len(results), "workflows": results}
+    if failed:
+        out["workflows_with_errors"] = failed
+    return out
 
 
-def redeploy_workflow(workflow_name: str, yaml_content: str, s3_bucket: str = "", s3_key: str = "") -> dict:
+def redeploy_workflow(workflow_name: str, yaml_content: str, s3_bucket: str = "", s3_key: str = "",
+                      expected_bucket_owner: str = "") -> dict:
     """Update an existing workflow's YAML and start a new run. Reuses existing S3 location and role if not specified."""
     client = _get_client()
 
-    arn, name, _ = _resolve_workflow_arn(workflow_name)
+    # Validate FIRST, before any AWS call: a broken definition is refused anyway, and
+    # the local message is more actionable than the service's.
+    try:
+        import validator
+        pre = validator.validate(yaml_content)
+        if not pre["valid"]:
+            return {
+                "error": "Definition failed local validation; the workflow was NOT changed.",
+                "validation_errors": pre["errors"],
+                "hint": "Call repair_dag_yaml to fix the mechanical problems, then retry.",
+            }
+    except Exception as e:  # noqa: BLE001 - a validator failure must not block redeploy
+        log.warning("Local validation could not run: %s", e)
+
+    # Mutating: this OVERWRITES a deployed definition, so a substring must not be
+    # allowed to pick the wrong workflow.
+    arn, name, _ = _resolve_workflow_arn(workflow_name, require_unambiguous=True)
     if arn is None:
         return {"error": name}
 
@@ -1532,9 +1830,9 @@ def redeploy_workflow(workflow_name: str, yaml_content: str, s3_bucket: str = ""
     # Upload new YAML
     s3 = boto3.client("s3")
     try:
-        s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=yaml_content.encode("utf-8"))
-    except Exception as e:
-        return {"error": f"S3 upload failed: {str(e)}"}
+        _put_object(s3, s3_bucket, s3_key, yaml_content.encode("utf-8"), expected_bucket_owner)
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller
+        return {"error": f"S3 upload failed: {e}"}
 
     # Update workflow
     try:
@@ -1543,8 +1841,8 @@ def redeploy_workflow(workflow_name: str, yaml_content: str, s3_bucket: str = ""
             DefinitionS3Location={"Bucket": s3_bucket, "ObjectKey": s3_key},
             RoleArn=role_arn,
         )
-    except Exception as e:
-        return {"error": f"Update failed: {str(e)}"}
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller
+        return {"error": f"Update failed: {e}"}
 
     # Start run
     try:
