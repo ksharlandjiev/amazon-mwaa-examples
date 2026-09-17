@@ -193,13 +193,17 @@ task; `repair_dag_yaml` moves a misplaced one down onto the sensors.
 
 ### Author a real pipeline
 
+You need two things before step 4, and neither is created for you:
+
+- **an S3 bucket you own**, for the definition and any code bundle;
+- **a workflow execution role** — step 3 generates the policy and the CLI commands for it.
+
 1. `plan_pipeline(["glue_job", "glue_job", "glue_crawler", "athena_query"])` — get the operators, the questions to ask, and what was left out.
-2. Ask the user those questions.
-3. `build_dag_yaml(...)` — correct-by-construction YAML, already validated.
-4. `preflight_dag_yaml(...)` — the service validates it for real, then the throwaway workflow is deleted.
-5. `generate_execution_role(...)` — least-privilege policy plus CLI commands.
-6. `mwaa_deploy_and_run(...)`.
-7. `mwaa_poll_run(...)` then **`mwaa_verify_run_tasks(...)`**.
+2. Ask the user those questions, then `build_dag_yaml(...)` — correct-by-construction YAML, already validated. Check `values_adjusted` for anything it coerced or capped on your behalf.
+3. `generate_execution_role(account_id=…, region=…)` — a policy with **no** `Resource: "*"`, plus the CLI commands to create the role. Do this **before** preflight: preflight needs the role ARN.
+4. `preflight_dag_yaml(yaml, bucket, role_arn)` — the service validates it for real, then the throwaway workflow is deleted.
+5. `mwaa_deploy_and_run(...)` — note this **updates** an existing workflow of the same name and starts a **billable** run.
+6. `mwaa_poll_run(...)` then **`mwaa_verify_run_tasks(...)`**.
 
 ### Fix hand-written or inherited YAML
 
@@ -207,18 +211,58 @@ task; `repair_dag_yaml` moves a misplaced one down onto the sensors.
 
 ### Migrate a Python DAG
 
-`analyze_python_dag_tool` → `convert_python_to_yaml_tool` → `validate_dag_yaml`. The converter emits mapping-shaped, fully-qualified YAML, converts `timedelta(...)` to the right form, and flags Python/Bash tasks that need a code bundle.
+`analyze_python_dag_tool` → `convert_python_to_yaml_tool` → `validate_dag_yaml`. The converter emits mapping-shaped, fully-qualified YAML, converts `timedelta(...)` to the right form, and flags Python/Bash tasks that need a code bundle. Your Python is only ever parsed with `ast`, never executed.
+
+**Check `faithful` and `dropped`, not just `valid`.** `valid` means the YAML matches the
+schema; `faithful: false` means the emitted DAG is *not equivalent to the Python you
+supplied*, and every difference is itemised in `dropped` with the source expression and
+what to do about it. Things that land there rather than disappearing: arguments whose
+value is a variable, function call or f-string; lists and dicts containing any of those;
+`default_args` keys the service does not honour (`depends_on_past`, `sla`, `email`);
+dependency edges whose endpoint is built in a helper or a loop; duplicate `task_id`s; and
+a second DAG in the same file. `analyze_python_dag_tool` reports the same thing up front
+as `conversion_would_drop`.
 
 ## Where a model is (and is not) involved
 
-36 of the 37 tools are deterministic Python — schema validation, repair, planning, YAML
+37 of the 38 tools are deterministic Python — schema validation, repair, planning, YAML
 assembly, code bundling, deploy and run inspection all run without calling a model. Your
 own agent supplies the intelligence; this server supplies verified rules and AWS calls.
 
-Exactly one tool calls a model: `mwaa_get_failed_runs` with `analyze=true` sends the
-collected failure details and CloudWatch task logs to Amazon Bedrock for root-cause
-analysis. Everything else in that response — the failures, the task logs, the hidden
-failed tasks — is gathered without a model and stands on its own.
+Exactly one tool calls a model: `mwaa_get_failed_runs`.
+
+> ### ⚠ Data flow: failure analysis is **on by default**
+>
+> `mwaa_get_failed_runs` takes `analyze=true` by default, and the deployed stack grants
+> `bedrock:InvokeModel` by default (`EnableFailureAnalysis=true`), so the feature works
+> out of the box. Know what that means before you use it.
+>
+> **What leaves your account.** The collected failure details **including CloudWatch task
+> log excerpts** (up to 12,000 characters) are sent to Amazon Bedrock. Task logs routinely
+> contain bucket names, ARNs, account ids, table names and sometimes fragments of your
+> data.
+>
+> **Where it goes.** The default model chain leads with `us.anthropic.claude-haiku-4-5-…`
+> and `us.amazon.nova-lite-v1:0` — both **cross-Region inference profiles** — so that
+> content may be processed in a different AWS Region than your workflows run in. The
+> `us.` prefixes are not incidental: most current models are not offered for direct
+> on-demand invocation, which is why the chain leads with profiles rather than
+> Region-local ids.
+>
+> **You have four ways to control it**, from most to least restrictive:
+>
+> | Goal | How | Effect |
+> |---|---|---|
+> | No Bedrock access at all | Deploy with `EnableFailureAnalysis=false` | `bedrock:InvokeModel` is not in the policy. Also set `analyze=false` per call, or every call wastes four AccessDenied attempts before reporting `analysis_unavailable`. |
+> | Keep the capability, decide per call | Leave the default, pass `analyze=false` | Nothing is sent unless a caller explicitly asks for analysis. |
+> | Keep the analysis, keep data in-Region | Set `BEDROCK_REGION`, **and** pin a non-`us.` `BEDROCK_MODEL_ID` | Inference stays in the Region you name. Confirm the model you pin is available there — an unreachable pinned id fails loudly rather than silently falling back. |
+> | Local stdio mode | Nothing to configure | No Lambda role is involved; the call is made under your own credentials, and the same `analyze` / `BEDROCK_*` controls apply. |
+>
+> **You lose nothing by turning it off.** Everything else in that response — the failures,
+> the task logs, the hidden failed tasks that a green `RunState` masked — is gathered
+> without a model, is complete on its own, and is the authoritative source. The AI step
+> summarises findings you already have. Review this before use if you have data-residency
+> obligations.
 
 Model selection:
 
@@ -274,11 +318,22 @@ Log group is derived from the **ARN**, not the name returned by `ListWorkflows`:
 | `repair_dag_yaml` | Auto-fix the mechanical mistakes and report every change. |
 | `preflight_dag_yaml` | Have the service itself validate, then clean up. |
 | `generate_execution_role` | Least-privilege IAM role scoped to the operators used. |
-| `generate_dag_yaml` | Self-contained demo workflow for one service. Not a pipeline starting point. |
+| `generate_dag_yaml` | Demo workflow for one service. **Check `params_you_must_set`** — only ~half are fully self-contained. Not a pipeline starting point. |
 | `compose_dag_yaml_tool` | Chain several service demo blocks. |
 | `get_service_tasks_tool` | Inspect one service's demo block. |
 | `analyze_python_dag_tool` | Compatibility analysis of a Python DAG. |
 | `convert_python_to_yaml_tool` | Convert a Python DAG to validated YAML. |
+
+> **On the demo templates.** 15 of the 29 are fully self-contained and run as emitted:
+> `s3`, `lambda`, `bedrock`, `redshift`, `rds`, `dms`, `neptune`, `glacier`, `appflow`,
+> `quicksight`, `dynamodb`, `opensearch_serverless`, `emr_serverless`, `eventbridge`,
+> `cloudformation`. The other 14 need an identifier their own stack generates — a
+> `!Ref`'d bucket name, a `!GetAtt` role ARN — which cannot be known before the stack
+> exists, because `CloudFormationCreateStackOperator` returns `None` via XCom. Those come
+> back as params with `REPLACE_ME` defaults listed in `params_you_must_set`. Fill them in,
+> or the DAG will provision its stack, fail the work task on the placeholder, and tear the
+> stack back down. They are also **not** production starting points: they create and
+> destroy real infrastructure. Use `plan_pipeline` + `build_dag_yaml` for a real pipeline.
 
 ### Python / Bash code
 
@@ -383,6 +438,26 @@ aws bedrock list-inference-profiles \
 Pinning a model disables the fallback chain, so an unreachable id fails loudly with
 `analysis_unavailable` instead of quietly answering from a different model.
 
+## Prerequisites
+
+| | Local stdio | Deployed Function URL |
+|---|---|---|
+| Python | 3.10+ | — (Lambda runs 3.12) |
+| `boto3` | `~=1.40` (see `src/requirements.txt`) | installed by `sam build` |
+| AWS SAM CLI | — | 1.100+ |
+| AWS CLI | v2, for the role/IAM commands | v2 |
+| `uv` / `uvx` | — | needed for `mcp-proxy-for-aws` |
+| AWS credentials | any principal that can call MWAA Serverless | a principal that can create IAM roles and Lambda functions (`CAPABILITY_IAM`) |
+
+`sam build` for this stack is a plain Python zip build and does **not** require Docker.
+Install `uv` (which provides `uvx`) from
+[docs.astral.sh/uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+**Region.** MWAA Serverless is not available everywhere, and this sample defaults to
+`us-east-1` in `samconfig.toml` — a value you should change rather than inherit. The
+Region must be one where MWAA Serverless is offered and where your workflows live. Bedrock
+is configured separately via `BEDROCK_REGION`, so the two do not have to match.
+
 ## Running it
 
 Two transports. Pick based on who needs to reach it.
@@ -425,7 +500,14 @@ sam build
 sam deploy --guided     # first time; afterwards just: sam deploy
 ```
 
-Take `McpFunctionUrl` from the Outputs. The transport is a **Lambda Function URL with
+`samconfig.toml` already pins `stack_name`, `region = "us-east-1"` and
+`capabilities = "CAPABILITY_IAM"`, so a plain `sam deploy` uses those — **change the
+region there or pass `--region`** rather than silently deploying to us-east-1. Read
+[Security considerations](#security-considerations) and set the scope-down parameters
+before you deploy anything you care about.
+
+Take `McpFunctionUrl` from the Outputs, and check `S3AccessScope` in the same Outputs to
+confirm the function is not holding account-wide S3 access. The transport is a **Lambda Function URL with
 `AuthType: AWS_IAM`** — there is no API Gateway.
 
 Redeploy after changing code:
@@ -559,17 +641,79 @@ granting all of that.
   included in `AdministratorAccess` and `PowerUserAccess`, so in an account where everyone
   is an admin this blocks the internet but not your colleagues. Grant a dedicated invoke
   role if you need that distinction.
-- **Scope the function's policy down.** The template uses `Resource: "*"`. Restrict it to
-  the workflows and buckets you use, and remove `DeleteWorkflow` if the server never
-  deletes.
-- **`mwaa_delete_workflows` is destructive and irreversible.** It previews by default;
-  confirm the dry-run output before passing `dry_run=false`.
+- **⚠ Anyone who can invoke this endpoint can run arbitrary code under any passable
+  role.** This is the finding to understand before you deploy, and it is not merely "broad
+  permissions". The function holds `CreateWorkflow`, `s3:PutObject` and `iam:PassRole`, and
+  it exposes `build_code_bundle` plus `mwaa_deploy_and_run(code_zip_base64=…)`, which run
+  `PythonOperator`/`BashOperator` code on a worker. Composed, an authorized caller can
+  deploy a workflow that executes their code under **any role in the account that is
+  passable to `airflow-serverless.amazonaws.com`** — including roles far more privileged
+  than this function. That is a lateral-movement primitive. Narrow it with the template
+  parameters below, and grant `lambda:InvokeFunctionUrl` to one dedicated principal.
+- **Scope the function's policy down with the stack parameters.** The template ships with
+  **no `Resource: "*"` anywhere**, but two defaults are deliberately loose so a first
+  deploy works. Set them:
+
+  | Parameter | Default | Set it to |
+  |---|---|---|
+  | `WorkflowBucketName` | *(empty — every bucket in the account)* | the one bucket you use |
+  | `PassableExecutionRolePath` | `mwaa-serverless-*` | the narrowest prefix, or one role name |
+  | `AllowWorkflowDeletion` | `false` | leave false unless you need the delete tool |
+  | `EnableFailureAnalysis` | `true` | `false` if your task logs must not leave the account |
+
+  ```bash
+  sam deploy --parameter-overrides \
+    WorkflowBucketName=my-workflow-bucket \
+    PassableExecutionRolePath='mwaa-serverless-*' \
+    AllowWorkflowDeletion=false \
+    EnableFailureAnalysis=true
+  ```
+
+  The first three are about **blast radius** — what an authorized caller can reach.
+  `EnableFailureAnalysis` is a different question: it is about **data flow**, not damage.
+  It grants no write access and destroys nothing; it decides whether CloudWatch task log
+  excerpts may be sent to Bedrock, possibly cross-Region. It defaults to `true` so the
+  feature works on a first deploy. See
+  [the data-flow callout](#where-a-model-is-and-is-not-involved) for the four ways to
+  control it, and turn it off if your logs are sensitive.
+
+  The `S3AccessScope` output tells you whether the deployed function ended up scoped or
+  not. Note that `iam:PassedToService` constrains which **service** receives a role, not
+  which role may be passed — both conditions are needed, and the template sets both.
+- **Grant invoke access to one principal, not to everyone who is an admin.**
+
+  ```bash
+  aws iam create-role --role-name mcp-invoker \
+    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+      "Principal":{"AWS":"arn:aws:iam::<ACCOUNT>:user/<YOU>"},"Action":"sts:AssumeRole"}]}'
+  aws iam put-role-policy --role-name mcp-invoker --policy-name invoke \
+    --policy-document "$(aws cloudformation describe-stacks \
+      --stack-name mwaa-serverless-mcp \
+      --query 'Stacks[0].Outputs[?OutputKey==`InvokePolicyHint`].OutputValue' \
+      --output text | python3 -c 'import json,sys; print(json.dumps({"Version":"2012-10-17","Statement":[json.load(sys.stdin)]}))')"
+  ```
+- **`mwaa_delete_workflows` targets EVERY workflow in the account when called with no
+  filter.** Not just the ones this server created. It previews by default, and an
+  unfiltered non-dry-run call is now **refused** — deleting everything requires
+  `confirm_delete_all=true`. Always pass `name_contains` or `not_run_in_days`, and read the
+  dry-run list before passing `dry_run=false`.
+- **Three other tools mutate or cost money.** `mwaa_deploy_and_run` **updates** an existing
+  workflow of the same name and starts a billable run; `mwaa_redeploy` overwrites the
+  deployed definition and the S3 object behind it, then reruns; `mwaa_stop_run` kills an
+  in-flight run. All three now require an **exact** workflow name — a partial match is
+  refused, because overwriting the wrong workflow is unrecoverable.
 - **Signing needs live credentials.** Static temporary credentials in environment
   variables stop working at expiry; a profile with SSO or role refresh does not.
 - **Never commit `src/mcp_config.json`.** It is git-ignored. Keep secrets out of it
   regardless — it holds configuration, not credentials.
 - **`preflight_dag_yaml` creates and deletes a throwaway workflow** to obtain the
-  service's own verdict. It counts against the 100-workflow quota for a few seconds.
+  service's own verdict. It counts against the 100-workflow quota for a few seconds, and
+  writes then deletes two objects in the bucket you name. If cleanup fails, the response
+  names the leftover workflow and objects so you can remove them.
+- **Pass `expected_bucket_owner` on the tools that write to S3.** `mwaa_deploy_and_run`,
+  `mwaa_redeploy` and `preflight_dag_yaml` accept it and forward it as
+  `ExpectedBucketOwner`, so the upload fails instead of writing into a bucket you do not
+  own. All writes use SSE-S3 encryption.
 
 ### Why there is no API Gateway
 
@@ -585,6 +729,71 @@ API with *"Unable to set DefaultAuthorizer because 'AWS_IAM' was not defined in
 - **The 29-second ceiling.** API Gateway capped every request at 29s, which is why
   `mwaa_poll_run` had to give up after 25s and be called repeatedly. The Lambda timeout is
   now 120s and a single poll waits up to 110s, so most task transitions finish in one call.
+
+## What this sample costs
+
+The [Cost](#cost-dont-pay-for-waiting) section above is about the DAGs you author. This is
+about running the server itself. Nothing here is free-tier guaranteed; see the
+[MWAA](https://aws.amazon.com/managed-workflows-for-apache-airflow/pricing/),
+[Lambda](https://aws.amazon.com/lambda/pricing/),
+[S3](https://aws.amazon.com/s3/pricing/),
+[CloudWatch](https://aws.amazon.com/cloudwatch/pricing/) and
+[Bedrock](https://aws.amazon.com/bedrock/pricing/) pricing pages for current rates.
+
+- **Local stdio mode costs nothing to run.** Only the AWS calls it makes are billed.
+- **Lambda:** 512 MB, and a single `mwaa_poll_run` can occupy the function for up to 110
+  seconds. `ReservedConcurrentExecutions: 5` bounds the worst case.
+- **MWAA Serverless is the real cost.** `preflight_dag_yaml`, `mwaa_deploy_and_run` and
+  `mwaa_redeploy` create **real** workflows and start **real** runs, billed for the time
+  each task occupies a worker.
+- **S3:** definitions are small; code bundles can be up to 250 MB each.
+- **CloudWatch Logs:** ingestion and storage for your workflows' task logs, plus this
+  function's own logs (retention is set by the `LogRetentionDays` parameter, default 30 —
+  an implicitly created Lambda log group would never expire).
+- **Bedrock:** per-token, and **on by default** (`EnableFailureAnalysis=true` plus
+  `analyze=true`). `mwaa_get_failed_runs` fans out across workflows, so one call can mean
+  one inference per scan with up to `bedrock_max_tokens` (2000) of output. Deploy with
+  `EnableFailureAnalysis=false`, or pass `analyze=false`, if you would rather not pay for
+  it — the log-based findings are unaffected.
+- **The demo templates provision real infrastructure** — EMR clusters, RDS instances,
+  Redshift workgroups, EKS clusters. They tear it down again, but they bill while running,
+  and a failed teardown leaves it running. Check with `mwaa_verify_run_tasks`.
+
+## Cleaning up
+
+`sam delete` removes the server. It does **not** remove anything the tools created, so do
+these too:
+
+```bash
+# 1. Workflows this server created (ALWAYS review the dry run first)
+#    Called with no filter this targets every workflow in the account — pass a filter.
+#    Via your MCP client: mwaa_list_workflows, then
+#                         mwaa_delete_workflows(name_contains="<your-prefix>")
+
+# 2. The definitions and code bundles in your own bucket
+aws s3 rm "s3://<your-workflow-bucket>/workflows/" --recursive
+aws s3 rm "s3://<your-workflow-bucket>/preflight/" --recursive   # only if preflight left any
+
+# 3. Task log groups — these retain and bill indefinitely
+#    Note: each preflight_dag_yaml call also leaves one empty log group behind
+#    (the service creates it for the throwaway workflow and it outlives it). Empty
+#    groups store nothing and cost nothing, but they accumulate — the response's
+#    `log_group_residue` names each one.
+aws logs describe-log-groups --log-group-name-prefix /aws/mwaa-serverless/ \
+  --query 'logGroups[].logGroupName' --output text \
+  | tr '\t' '\n' | xargs -I{} aws logs delete-log-group --log-group-name {}
+
+# 4. Any execution role you created from generate_execution_role
+aws iam delete-role-policy --role-name mwaa-serverless-<dag_id>-role --policy-name <dag_id>-policy
+aws iam delete-role --role-name mwaa-serverless-<dag_id>-role
+
+# 5. Any CloudFormation stacks a demo DAG left behind after a failed teardown
+aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE DELETE_FAILED \
+  --query "StackSummaries[?contains(StackName,'mwaa-')].StackName"
+
+# 6. The server itself, and the SAM artifact bucket (resolve_s3 = true created it)
+sam delete --stack-name mwaa-serverless-mcp
+```
 
 ## Troubleshooting
 
@@ -633,20 +842,89 @@ serverless/mcp/
     ├── python_analyzer.py  # Python DAG compatibility analysis
     ├── python_converter.py # Python-to-YAML conversion
     ├── mcp_config.example.json # copy to mcp_config.json and edit
-    ├── requirements.txt        # Lambda runtime deps
+    ├── requirements.txt        # Lambda runtime deps (pinned)
     └── requirements-local.txt  # adds `mcp` for local stdio mode
+├── pytest.ini
+├── ruff.toml
+└── tests/                  # no test calls AWS
+    ├── conftest.py
+    ├── test_validator.py            # schema rules + untrusted-input bounds
+    ├── test_python_migration.py     # conversion fidelity, nothing dropped silently
+    ├── test_builder_and_schema.py   # correct-by-construction + cross-module invariants
+    ├── test_security.py             # IAM output, demo templates, destructive ops
+    └── test_tool_surface.py         # both transports expose the same 38 tools
 ```
 
 ## Lambda IAM permissions
 
-| Permission | Purpose |
+Almost every statement is ARN-scoped to this account and Region. Three actions use
+`Resource: '*'` because the API cannot scope them — they are collection-level operations,
+all read-or-create, none destructive:
+
+| Action | Why it cannot be scoped |
 |---|---|
-| `airflow-serverless:*Workflow*`, `*WorkflowRun*` | Workflow and run management |
-| `s3:GetObject/PutObject/DeleteObject/ListBucket` | Definitions and code bundles; preflight cleanup |
-| `logs:DescribeLogGroups/DescribeLogStreams/GetLogEvents` | Per-task outcome verification |
-| `bedrock:InvokeModel` | Failure root-cause analysis |
-| `iam:PassRole` (scoped to `airflow-serverless.amazonaws.com`) | Pass the execution role on create |
+| `airflow-serverless:ListWorkflows` | Enumerates the account; there is no per-item ARN to name |
+| `airflow-serverless:CreateWorkflow` | The workflow does not exist yet, so there is nothing to name |
+| `logs:DescribeLogGroups` | Enumerates log groups; it does not read one |
+
+This was found by deploying, not by linting: scoped to `workflow/*` these evaluate to
+`implicitDeny` (confirm with `aws iam simulate-principal-policy`), so every
+name-resolving tool failed with `AccessDeniedException` at run time while `cfn-lint` and
+`sam build` both reported success. A test now enforces that the wildcard list stays
+exactly these three and that nothing destructive joins it.
+
+| Permission | Resource scope | Purpose |
+|---|---|---|
+| `airflow-serverless:ListWorkflows`, `CreateWorkflow` | `*` — collection-level, see above | Discover workflows; create one |
+| `airflow-serverless:GetWorkflow`, `GetWorkflowRun`, `ListWorkflowRuns`, `ListWorkflowVersions` | `…:workflow/*` in this account+Region | Read a workflow and its runs |
+| `airflow-serverless:UpdateWorkflow`, `StartWorkflowRun`, `StopWorkflowRun` | `…:workflow/*` in this account+Region | Deploy and run |
+| `airflow-serverless:DeleteWorkflow` | same — **omitted unless `AllowWorkflowDeletion=true`** | The delete tool |
+| `s3:GetObject/PutObject/DeleteObject` | `WorkflowBucketName/*`, else every bucket | Definitions and code bundles; preflight cleanup |
+| `s3:ListBucket/GetBucketLocation` | `WorkflowBucketName`, else every bucket | Same |
+| `logs:DescribeLogGroups` | `*` — collection-level, see above | Find a workflow's log group |
+| `logs:DescribeLogStreams`, `logs:GetLogEvents` | `log-group:/aws/mwaa-serverless/*` | Per-task outcome verification |
+| `bedrock:InvokeModel` | foundation models + inference profiles in this Region — **omitted when `EnableFailureAnalysis=false`** | Failure root-cause analysis. Granted by default; see the data-flow callout. |
+| `iam:PassRole` | `role/${PassableExecutionRolePath}`, **and** `iam:PassedToService: airflow-serverless.amazonaws.com` | Pass the execution role on create |
+
+The two conditions on `iam:PassRole` do different jobs and you need both:
+`iam:PassedToService` limits which **service** receives the role; the `Resource` pattern
+limits **which role** can be passed. With only the first, any role in the account is
+passable — see [Security considerations](#security-considerations).
 
 Callers of the deployed endpoint need only `lambda:InvokeFunctionUrl` on the function.
 In local stdio mode there is no endpoint, and the tools use your own credentials, so
 none of the above is granted to anyone.
+
+## Tests
+
+```bash
+cd serverless/mcp
+pip install -r src/requirements-local.txt pytest ruff cfn-lint bandit
+python -m pytest
+ruff check .
+cfn-lint template.yaml
+bandit -r src/
+```
+
+No test calls AWS. Workflow operations run against a stub client that records destructive
+calls, so the tests assert those calls did **not** happen. The suite covers the schema
+rules, the untrusted-input bounds, every generated IAM policy, all 29 demo templates
+(including that the CloudFormation they embed parses and has no dangling references), and
+the cross-module invariants between `schema.py` and `constraints.py`.
+
+These four checks run in CI on any change under `serverless/mcp/`
+([.github/workflows/serverless-mcp.yml](../../.github/workflows/serverless-mcp.yml)). The
+workflow is path-scoped to this directory, needs no AWS credentials, and is expected to
+stay at zero findings rather than carry a baseline of accepted ones.
+
+Passing all four is necessary but not sufficient. Three real defects in this sample were
+invisible to every one of them and only surfaced by deploying and running against the
+service: an IAM policy that lints clean but denies at run time, an operator that writes no
+log stream, and a false positive on the documented XCom idiom. Run a live workflow before
+trusting a change to the IAM generator, the log readers, or the validator.
+
+## License and contributing
+
+This sample is released under the **MIT-0** license — see [LICENSE](../../LICENSE).
+Contribution guidance is in [CONTRIBUTING.md](../../CONTRIBUTING.md), and the code of
+conduct is in [CODE_OF_CONDUCT.md](../../CODE_OF_CONDUCT.md).
