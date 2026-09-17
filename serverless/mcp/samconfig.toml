@@ -6,9 +6,11 @@
 # here or override per command with `sam deploy --region <your-region>`; otherwise a
 # plain `sam deploy` silently targets us-east-1.
 #
-# NOTE ON PARAMETERS: parameter_overrides below is where you scope the function's
-# permissions down. Set WorkflowBucketName to the bucket you use — leaving it empty
-# grants S3 read/write across every bucket in the account. See template.yaml.
+# NOTE ON PARAMETERS: WorkflowBucketName is REQUIRED and has no default. A plain
+# `sam deploy` will fail until you set it, which is deliberate — it used to accept an
+# empty value and fall back to granting S3 access across every bucket in the account,
+# so the laziest deploy produced the widest permissions. Fill it in below, or pass
+# `--parameter-overrides WorkflowBucketName=...` per command.
 
 version = 0.1
 
@@ -22,7 +24,8 @@ s3_prefix = "mwaa-serverless-mcp"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 image_repositories = []
-# Uncomment and fill in before deploying anything you care about:
+# REQUIRED — replace the bucket name, then uncomment. The rest are optional; the
+# defaults shown are the ones the template already applies.
 # parameter_overrides = [
 #   "WorkflowBucketName=my-mwaa-workflow-bucket",
 #   "PassableExecutionRolePath=mwaa-serverless-*",

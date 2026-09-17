@@ -1208,3 +1208,80 @@ def test_an_oversized_bundle_leaves_nothing_behind_in_s3(monkeypatch, stubbed):
 
     assert "error" in result
     assert writes == [], f"nothing should have been written, got {writes}"
+
+
+
+# --- S3 scope must not be optional ------------------------------------------
+# WorkflowBucketName used to default to '' and fall back to arn:aws:s3:::*/*, so the
+# simplest possible deploy produced the widest possible grant.
+
+
+def test_the_workflow_bucket_parameter_is_required():
+    """No default. `sam deploy` must fail rather than silently produce the wide grant."""
+    doc = _load_cfn((REPO_ROOT / "template.yaml").read_text())
+    param = doc["Parameters"]["WorkflowBucketName"]
+    assert "Default" not in param, (
+        "WorkflowBucketName must have no default; an empty value is what produced the "
+        "account-wide S3 grant"
+    )
+    assert param.get("MinLength", 0) >= 3, "an empty string must not satisfy the pattern"
+    assert param.get("AllowedPattern"), "constrain it to a real bucket name"
+
+
+def test_no_statement_can_reach_every_bucket():
+    """The fallback branch is gone, so there is no path to a bucket wildcard at all."""
+    text = (REPO_ROOT / "template.yaml").read_text()
+    for forbidden in ("s3:::*/*", "s3:::*'", 's3:::*"'):
+        assert forbidden not in text, f"template still contains an S3 wildcard: {forbidden}"
+
+
+def test_s3_statements_assert_the_owning_account():
+    """S3 ARNs carry no account id, so naming a bucket in an identity policy says
+    nothing about who owns it. Without a condition, a bucket policy in another account
+    could combine with this grant into a confused-deputy path."""
+    statements = _template_statements()
+    s3_statements = [
+        s for s in statements
+        if any("s3:" in a for a in (s["Action"] if isinstance(s["Action"], list)
+                                    else [s["Action"]]))
+    ]
+    assert s3_statements, "expected the S3 statements to be unconditional"
+    for statement in s3_statements:
+        condition = statement.get("Condition") or {}
+        keys = {k for v in condition.values() for k in v} if condition else set()
+        assert "s3:ResourceAccount" in keys, (
+            f"{statement['Sid']} does not assert s3:ResourceAccount, so it would accept "
+            f"a bucket owned by another account"
+        )
+
+
+def test_bucket_owner_assertion_comes_from_the_stack_not_the_caller(monkeypatch):
+    """A caller-supplied ExpectedBucketOwner is the caller asserting a claim about a
+    bucket it chose, which guards nothing. The stack's value must win."""
+    captured = {}
+
+    class S3:
+        def put_object(self, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+    monkeypatch.setenv("EXPECTED_BUCKET_OWNER", "111122223333")
+    operations._put_object(S3(), "b", "k", b"body", expected_bucket_owner="999999999999")
+    assert captured["ExpectedBucketOwner"] == "111122223333", \
+        "the caller must not be able to substitute its own owner claim"
+    assert captured["ServerSideEncryption"] == operations._SSE_ALGORITHM
+
+
+def test_bucket_owner_falls_back_to_the_argument_when_unconfigured(monkeypatch):
+    """Running locally over stdio there is no stack, so the caller's value is all there
+    is and it must still be sent."""
+    captured = {}
+
+    class S3:
+        def put_object(self, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+    monkeypatch.delenv("EXPECTED_BUCKET_OWNER", raising=False)
+    operations._put_object(S3(), "b", "k", b"body", expected_bucket_owner="999999999999")
+    assert captured["ExpectedBucketOwner"] == "999999999999"

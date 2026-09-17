@@ -48,11 +48,19 @@ Description: MCP Server for MWAA Serverless workflow authoring, validation and o
 Parameters:
   WorkflowBucketName:
     Type: String
-    Default: ''
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: >-
+      must be a valid S3 bucket name (3-63 chars, lowercase letters, digits, dots and
+      hyphens, starting and ending alphanumeric).
     Description: >-
       Bucket the server may read and write workflow definitions and code bundles in.
-      STRONGLY RECOMMENDED. Leave empty and S3 access falls back to every bucket in
-      the account, which lets an authorized caller overwrite arbitrary objects.
+      REQUIRED — there is deliberately no default. This parameter used to accept an
+      empty value and fall back to every bucket in the account, which meant the
+      easiest possible deploy produced the widest possible S3 grant. An authorized
+      caller chooses the destination bucket and key, and S3 ARNs carry no account id,
+      so that fallback also allowed writes into buckets this account does not own.
   PassableExecutionRolePath:
     Type: String
     Default: 'mwaa-serverless-*'
@@ -87,7 +95,6 @@ Parameters:
     Description: CloudWatch retention for this function's own logs. 0 = never expire.
 
 Conditions:
-  ScopeToOneBucket: !Not [!Equals [!Ref WorkflowBucketName, '']]
   DeletionAllowed: !Equals [!Ref AllowWorkflowDeletion, 'true']
   AnalysisEnabled: !Equals [!Ref EnableFailureAnalysis, 'true']
   RetainLogsForever: !Equals [!Ref LogRetentionDays, 0]
@@ -174,25 +181,31 @@ Resources:
               - !Ref AWS::NoValue
             # DeleteObject is used to clean up the throwaway definition that
             # preflight_dag_yaml stages so the service can validate it.
+            #
+            # Both statements name the one bucket unconditionally. There is no longer a
+            # fallback branch: the parameter is required, so the wide grant cannot be
+            # produced by omission. The s3:ResourceAccount condition adds the check the
+            # ARN cannot express — S3 ARNs contain no account id, so without it an
+            # identity policy naming a bucket says nothing about who owns that bucket.
             - Sid: WorkflowArtifactObjects
               Effect: Allow
               Action:
                 - s3:GetObject
                 - s3:PutObject
                 - s3:DeleteObject
-              Resource: !If
-                - ScopeToOneBucket
-                - !Sub 'arn:${AWS::Partition}:s3:::${WorkflowBucketName}/*'
-                - !Sub 'arn:${AWS::Partition}:s3:::*/*'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${WorkflowBucketName}/*'
+              Condition:
+                StringEquals:
+                  s3:ResourceAccount: !Ref AWS::AccountId
             - Sid: WorkflowArtifactBucket
               Effect: Allow
               Action:
                 - s3:ListBucket
                 - s3:GetBucketLocation
-              Resource: !If
-                - ScopeToOneBucket
-                - !Sub 'arn:${AWS::Partition}:s3:::${WorkflowBucketName}'
-                - !Sub 'arn:${AWS::Partition}:s3:::*'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${WorkflowBucketName}'
+              Condition:
+                StringEquals:
+                  s3:ResourceAccount: !Ref AWS::AccountId
             - !If
               - AnalysisEnabled
               - Sid: FailureAnalysis
@@ -221,6 +234,13 @@ Resources:
       Environment:
         Variables:
           LOG_LEVEL: INFO
+          # The bucket this deployment is scoped to, and the account that must own it.
+          # The server uses these as defaults so ownership is asserted from STACK
+          # configuration rather than from whatever the caller passes: a caller-supplied
+          # ExpectedBucketOwner is the caller asserting its own claim, which guards
+          # nothing.
+          WORKFLOW_BUCKET: !Ref WorkflowBucketName
+          EXPECTED_BUCKET_OWNER: !Ref AWS::AccountId
           # Optional: pin the model used by mwaa_get_failed_runs for root-cause
           # analysis. Leave unset to try a built-in candidate list (a Bedrock model
           # reaching end of life previously disabled this feature silently).
@@ -250,7 +270,4 @@ Outputs:
     Value: !Sub '{"Effect":"Allow","Action":"lambda:InvokeFunctionUrl","Resource":"${McpFunction.Arn}"}'
   S3AccessScope:
     Description: How broadly this function can read and write S3
-    Value: !If
-      - ScopeToOneBucket
-      - !Sub 'Scoped to s3://${WorkflowBucketName}'
-      - 'UNSCOPED — every bucket in this account. Redeploy with WorkflowBucketName set.'
+    Value: !Sub 'Scoped to s3://${WorkflowBucketName}, and only while that bucket is owned by ${AWS::AccountId}'

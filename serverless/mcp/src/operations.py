@@ -6,6 +6,7 @@
 import base64
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -52,17 +53,39 @@ _MAX_INLINE_CODE_BYTES = int((_LAMBDA_SYNC_PAYLOAD - 256 * 1024) * 3 / 4)
 _PREFLIGHT_NAME_PREFIX = "preflight-"
 
 
+def _configured_bucket_owner():
+    """Account id the deployment says must own the target bucket.
+
+    Set from the stack (EXPECTED_BUCKET_OWNER in template.yaml). This is the value that
+    matters: a caller-supplied ExpectedBucketOwner is the caller asserting a claim about
+    a bucket it chose, which guards nothing. When the stack sets this, it is the
+    deployment asserting the claim, and a caller cannot weaken it.
+    """
+    return os.environ.get("EXPECTED_BUCKET_OWNER", "").strip()
+
+
+def _configured_bucket():
+    """Bucket this deployment is scoped to, if any (WORKFLOW_BUCKET in template.yaml)."""
+    return os.environ.get("WORKFLOW_BUCKET", "").strip()
+
+
 def _put_object(s3, bucket, key, body, expected_bucket_owner=""):
     """Write to S3 with encryption and, when known, an owner assertion.
 
     ExpectedBucketOwner is the standard confused-deputy guard: without it, a caller
     who can reach this function can direct it to write into any bucket the execution
     role happens to have access to.
+
+    The stack's configured owner WINS over the caller's argument. S3 ARNs carry no
+    account id, so an identity policy naming a bucket says nothing about who owns it;
+    if the deployment has declared the owning account, that is the assertion to send,
+    and a caller must not be able to substitute its own.
     """
     kwargs = {"Bucket": bucket, "Key": key, "Body": body,
               "ServerSideEncryption": _SSE_ALGORITHM}
-    if expected_bucket_owner:
-        kwargs["ExpectedBucketOwner"] = expected_bucket_owner
+    owner = _configured_bucket_owner() or expected_bucket_owner
+    if owner:
+        kwargs["ExpectedBucketOwner"] = owner
     return s3.put_object(**kwargs)
 
 # Upper bound for a single poll call, kept below the Lambda timeout (120s in
