@@ -852,9 +852,14 @@ _MAX_ROLE_NAME_LEN = 64
 # Membership here is deliberately conservative. An action wrongly listed here is
 # granted more broadly than it needs to be, which is a security cost a reader inherits
 # silently; an action wrongly left out fails loudly with AccessDenied and can be added.
-# So only actions whose lack of resource support is established belong here, and
-# `verify_generated_policies.py` re-checks the whole set against live IAM with
-# iam:SimulateCustomPolicy.
+#
+# This set is NOT hand-reasoned. Every entry was confirmed against live IAM with
+# iam:SimulateCustomPolicy by `verify_generated_policies.py`, which asks the real
+# authorisation engine whether an ARN authorises the action. Curating it by recall
+# produced errors in both directions — RDS Describe* and Comprehend job actions were
+# excused when IAM scopes them perfectly well, while several Create* actions and the
+# Redshift Data API were being scoped into a guaranteed run-time denial. Re-run that
+# script rather than editing this by hand.
 _WILDCARD_ONLY_ACTIONS = {
     # Verified live against this account: the workflow does not exist yet, so a
     # workflow ARN cannot authorise its own creation.
@@ -862,11 +867,6 @@ _WILDCARD_ONLY_ACTIONS = {
     # ec2:Describe* defines no resource types whatsoever.
     "ec2:DescribeInstances",
     "ec2:DescribeInstanceStatus",
-    # RDS Describe* filter the account's collection rather than reading one item.
-    "rds:DescribeDBInstances",
-    "rds:DescribeDBClusters",
-    "rds:DescribeDBSnapshots",
-    "rds:DescribeExportTasks",
     # Batch Describe* accept lists of ids and authorise at the collection.
     "batch:DescribeJobs",
     "batch:DescribeJobQueues",
@@ -876,23 +876,43 @@ _WILDCARD_ONLY_ACTIONS = {
     # Redshift Describe* enumerate clusters and snapshots.
     "redshift:DescribeClusters",
     "redshift:DescribeClusterSnapshots",
-    # The Redshift Data API addresses statement ids, which are not IAM resources.
+    # The Redshift Data API addresses statement ids, which are not IAM resources — this
+    # applies to running a statement as well as reading one back.
     "redshift-data:DescribeStatement",
     "redshift-data:GetStatementResult",
     "redshift-data:CancelStatement",
-    # A task definition is not a resource for these two.
+    "redshift-data:ExecuteStatement",
+    "redshift-data:BatchExecuteStatement",
+    # A task definition is not a resource for describing one.
     "ecs:DescribeTaskDefinition",
-    "ecs:RegisterTaskDefinition",
     # DataSync List* enumerate the account.
     "datasync:ListTasks",
     "datasync:ListLocations",
     # Collection-level by name.
     "aoss:BatchGetCollection",
-    # Comprehend's PII detection jobs have no resource type.
-    "comprehend:DescribePiiEntitiesDetectionJob",
-    "comprehend:StartPiiEntitiesDetectionJob",
     # Crawler metrics are reported account-wide.
     "glue:GetCrawlerMetrics",
+    # Create* actions whose resource does not exist yet at authorisation time. Not all
+    # Create* actions behave this way — these are the ones IAM confirmed.
+    "eks:CreateCluster",
+    "elasticmapreduce:RunJobFlow",
+    "emr-containers:CreateVirtualCluster",
+    "emr-serverless:CreateApplication",
+    "glue:CreateDataQualityRuleset",
+    "kinesisanalytics:CreateApplication",
+    "rds:CancelExportTask",
+    # Operates across knowledge bases rather than on one named resource.
+    "bedrock:RetrieveAndGenerate",
+}
+
+# Actions IAM will not resource-scope AND that destroy something.
+#
+# These cannot be emitted either way. Scoped, IAM denies them; on "*", the policy would
+# grant account-wide destruction from a copy-paste CLI command — which is the single most
+# dangerous thing this generator could produce. So they are never generated, and the
+# caller is told to add them by hand if the DAG genuinely needs them.
+_UNSCOPABLE_DESTRUCTIVE_ACTIONS = {
+    "ecs:DeregisterTaskDefinition",
 }
 
 
@@ -1043,6 +1063,12 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
 
     destructive = sorted(a for a in all_actions
                          if a.split(":", 1)[-1].startswith(_DESTRUCTIVE_ACTION_VERBS))
+    # Refused outright, in both directions: IAM will not scope them, and granting
+    # destruction on Resource "*" from a copy-paste CLI command is not something this
+    # generator will emit. Reported instead, so the caller can add them deliberately.
+    refused = sorted(set(all_actions) & _UNSCOPABLE_DESTRUCTIVE_ACTIONS)
+    all_actions = set(all_actions) - set(refused)
+    destructive = [a for a in destructive if a not in refused]
     non_destructive = sorted(all_actions - set(destructive))
     if not include_destructive_actions:
         withheld, granted = destructive, non_destructive
@@ -1172,6 +1198,16 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
                 f"case where include_destructive_actions=True is the correct answer."
             )
         scope_down.append(note)
+    if refused:
+        scope_down.append(
+            "These actions were NOT granted, in either form: "
+            + ", ".join(refused)
+            + ". IAM will not scope them to a resource, and granting a destructive action "
+            "on Resource \"*\" is not something this generator will emit — that would hand "
+            "you a copy-paste command with account-wide destroy rights. If the DAG really "
+            "needs them, add a statement by hand, ideally in a separate role with a "
+            "permission boundary, having decided that the blast radius is acceptable."
+        )
     unscopable = sorted(set(all_actions) & _WILDCARD_ONLY_ACTIONS)
     if unscopable:
         scope_down.append(
@@ -1233,6 +1269,7 @@ def generate_execution_role_policy(yaml_content, account_id: str = "", region: s
         "unmapped_services": sorted(unmapped) or None,
         "destructive_actions_granted": destructive if include_destructive_actions else None,
         "destructive_actions_withheld": withheld or None,
+        "actions_refused_as_unscopable_and_destructive": refused or None,
         "teardown_tasks_affected": (
             _tasks_needing_destructive_actions(data) or None
             if withheld else None

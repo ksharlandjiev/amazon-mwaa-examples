@@ -1677,3 +1677,102 @@ def test_every_internal_readme_link_resolves():
         if target not in anchors
     ]
     assert not broken, f"broken internal links: {broken}"
+
+
+
+# --- the wildcard set is empirical, not reasoned -----------------------------
+
+
+def test_no_action_is_both_excused_and_refused():
+    """The two sets answer different questions and must not overlap: one widens a grant,
+    the other withholds it entirely."""
+    overlap = tools._WILDCARD_ONLY_ACTIONS & tools._UNSCOPABLE_DESTRUCTIVE_ACTIONS
+    assert not overlap, overlap
+
+
+def test_unscopable_destructive_actions_are_never_emitted():
+    """IAM will not scope them and this generator will not grant them on "*". Emitting
+    either form would be wrong, so neither is emitted."""
+    result = _policy_for("ecs", account_id="123456789012", region="us-east-1",
+                         include_destructive_actions=True)
+    granted = {
+        action
+        for statement in result["permissions_policy"]["Statement"]
+        for action in (statement["Action"] if isinstance(statement["Action"], list)
+                       else [statement["Action"]])
+    }
+    for action in tools._UNSCOPABLE_DESTRUCTIVE_ACTIONS:
+        assert action not in granted, f"{action} must never appear in a generated policy"
+
+    refused = result["actions_refused_as_unscopable_and_destructive"]
+    assert "ecs:DeregisterTaskDefinition" in refused
+    note = next(n for n in result["how_to_scope_down"] if "NOT granted" in n)
+    assert "account-wide destroy rights" in note
+    assert "add a statement by hand" in note
+
+
+def test_the_refusal_is_reported_even_when_destruction_is_withheld():
+    """It is reported either way, on purpose. With the default the action was not going to
+    be granted anyway, but the reader still needs to know that opting in will not grant it
+    either — otherwise they flip include_destructive_actions=True, get a policy that still
+    lacks it, and have nothing to explain why."""
+    withheld = _policy_for("ecs", account_id="123456789012", region="us-east-1")
+    opted_in = _policy_for("ecs", account_id="123456789012", region="us-east-1",
+                           include_destructive_actions=True)
+    assert withheld["actions_refused_as_unscopable_and_destructive"] == \
+        opted_in["actions_refused_as_unscopable_and_destructive"]
+    assert "ecs:DeregisterTaskDefinition" in withheld[
+        "actions_refused_as_unscopable_and_destructive"]
+
+
+def test_the_wildcard_set_records_that_it_came_from_simulation():
+    """Curating this set by recall produced errors in BOTH directions — RDS Describe* and
+    Comprehend jobs were excused when IAM scopes them fine, while several Create* actions
+    were being scoped into a guaranteed run-time denial. The comment has to say so, or
+    someone will "tidy" it by reasoning again."""
+    source = (REPO_ROOT / "src" / "tools.py").read_text()
+    block = source.split("_WILDCARD_ONLY_ACTIONS = {", 1)[0][-2000:]
+    assert "iam:SimulateCustomPolicy" in block
+    assert "NOT hand-reasoned" in block
+    assert "verify_generated_policies.py" in block
+
+
+@pytest.mark.parametrize("action", [
+    # Confirmed SCOPABLE by simulation, so they must not be excused. These were in the
+    # set when it was hand-curated.
+    "rds:DescribeDBInstances",
+    "rds:DescribeDBClusters",
+    "rds:DescribeDBSnapshots",
+    "rds:DescribeExportTasks",
+    "comprehend:DescribePiiEntitiesDetectionJob",
+    "comprehend:StartPiiEntitiesDetectionJob",
+    "ecs:RegisterTaskDefinition",
+])
+def test_actions_iam_can_scope_are_not_excused(action):
+    assert action not in tools._WILDCARD_ONLY_ACTIONS, (
+        f"{action} is scopable — live simulation says an ARN authorises it, so excusing "
+        f"it grants more than the DAG needs"
+    )
+
+
+@pytest.mark.parametrize("action", [
+    # Confirmed UNSCOPABLE by simulation. Scoping any of these produces implicitDeny at
+    # run time, which no local check can see.
+    "airflow-serverless:CreateWorkflow",
+    "ec2:DescribeInstances",
+    "eks:CreateCluster",
+    "elasticmapreduce:RunJobFlow",
+    "emr-serverless:CreateApplication",
+    "emr-containers:CreateVirtualCluster",
+    "glue:CreateDataQualityRuleset",
+    "kinesisanalytics:CreateApplication",
+    "rds:CancelExportTask",
+    "redshift-data:ExecuteStatement",
+    "redshift-data:BatchExecuteStatement",
+    "bedrock:RetrieveAndGenerate",
+])
+def test_actions_iam_refuses_to_scope_are_excused(action):
+    assert action in tools._WILDCARD_ONLY_ACTIONS, (
+        f"{action} cannot be resource-scoped — live simulation returns implicitDeny for "
+        f"an ARN, so scoping it would deny the task at run time"
+    )
