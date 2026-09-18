@@ -70,9 +70,17 @@ def get_server_config() -> str:
     file in use and the paths searched for it, and instructions for changing the
     model locally versus in a deployed Lambda.
 
+    Also reports `aws_region`: the Region every workflow, S3 and CloudWatch Logs call
+    in this process will go to, and where that Region came from. That Region is fixed
+    when the server starts and no tool takes a Region argument, so check it before
+    concluding a workflow is missing — an empty result from the wrong Region looks
+    identical to an empty result from the right one.
+
     Precedence is environment variable > config file > built-in default.
     """
-    return _j(_config.describe())
+    out = _config.describe()
+    out["aws_region"] = _operations.describe_region()
+    return _j(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════

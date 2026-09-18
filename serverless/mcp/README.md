@@ -721,6 +721,43 @@ API with *"Unable to set DefaultAuthorizer because 'AWS_IAM' was not defined in
   `mwaa_poll_run` had to give up after 25s and be called repeatedly. The Lambda timeout is
   now 120s and a single poll waits up to 110s, so most task transitions finish in one call.
 
+## One Region per running server
+
+The server resolves its AWS Region once, when the process starts, and every workflow,
+S3 and CloudWatch Logs call uses that Region for the life of the process. **No tool takes
+a Region argument.** To work in a different Region you change the environment and restart
+the server — in an MCP client, that means editing the server's `env` block and restarting
+the client so the subprocess is respawned.
+
+This matters more than it sounds, because a wrong Region is not an error. An empty
+workflow list from the wrong Region looks exactly like an empty workflow list from the
+right one. So:
+
+- `get_server_config` reports `aws_region` — the effective Region, where it came from,
+  and a reminder that it is fixed for the process. Check it before concluding that a
+  workflow is missing.
+- Passing an unsupported argument such as `region` is **rejected**, not ignored. The
+  error names the accepted arguments and points at `get_server_config`.
+
+### Set `AWS_DEFAULT_REGION`, not `AWS_REGION`
+
+botocore resolves the session Region from `AWS_DEFAULT_REGION` only —
+`botocore/configprovider.py` maps `'region'` to `('region', 'AWS_DEFAULT_REGION', None, None)`.
+`AWS_REGION` is **not** consulted, so setting only that leaves the Region coming from your
+profile, silently, in whatever Region that happens to be:
+
+```bash
+AWS_REGION=eu-west-1 python -c "import boto3; print(boto3.Session().region_name)"
+# -> us-east-1   (the profile's Region; AWS_REGION ignored)
+
+AWS_DEFAULT_REGION=eu-west-1 python -c "import boto3; print(boto3.Session().region_name)"
+# -> eu-west-1
+```
+
+It works in Lambda because the runtime sets both. Locally it does not. `get_server_config`
+reports `ignored_aws_region` when `AWS_REGION` is set but not taking effect, and the server
+logs a warning at startup.
+
 ## Client configuration
 
 Replace absolute paths and the Function URL with your own. Both transports expose the same
@@ -740,7 +777,7 @@ Local:
       "args": ["/abs/path/serverless/mcp/src/local_server.py"],
       "env": {
         "AWS_PROFILE": "your-profile",
-        "AWS_REGION": "us-east-1",
+        "AWS_DEFAULT_REGION": "us-east-1",
         "BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
       },
       "disabled": false
@@ -757,7 +794,7 @@ Remote:
     "mwaa-serverless": {
       "command": "uvx",
       "args": ["mcp-proxy-for-aws==1.7.0", "https://<id>.lambda-url.us-east-1.on.aws/"],
-      "env": { "AWS_PROFILE": "your-profile", "AWS_REGION": "us-east-1" },
+      "env": { "AWS_PROFILE": "your-profile", "AWS_DEFAULT_REGION": "us-east-1" },
       "disabled": false
     }
   }
@@ -777,14 +814,14 @@ Local:
     "mwaa-serverless": {
       "command": "/abs/path/serverless/mcp/src/.venv/bin/python",
       "args": ["/abs/path/serverless/mcp/src/local_server.py"],
-      "env": { "AWS_PROFILE": "your-profile", "AWS_REGION": "us-east-1" }
+      "env": { "AWS_PROFILE": "your-profile", "AWS_DEFAULT_REGION": "us-east-1" }
     }
   }
 }
 ```
 
 Remote — same shape as Kiro's remote block above. Claude Desktop launches a subprocess, so
-it does not inherit your shell environment: set `AWS_PROFILE` and `AWS_REGION` explicitly,
+it does not inherit your shell environment: set `AWS_PROFILE` and `AWS_DEFAULT_REGION` explicitly,
 and make sure `uvx` is on the PATH the desktop app sees (an absolute path is safest).
 
 ### Claude Code
@@ -792,12 +829,12 @@ and make sure `uvx` is on the PATH the desktop app sees (an absolute path is saf
 ```bash
 # local
 claude mcp add mwaa-serverless \
-  --env AWS_PROFILE=your-profile --env AWS_REGION=us-east-1 \
+  --env AWS_PROFILE=your-profile --env AWS_DEFAULT_REGION=us-east-1 \
   -- /abs/path/serverless/mcp/src/.venv/bin/python /abs/path/serverless/mcp/src/local_server.py
 
 # remote
 claude mcp add mwaa-serverless \
-  --env AWS_PROFILE=your-profile --env AWS_REGION=us-east-1 \
+  --env AWS_PROFILE=your-profile --env AWS_DEFAULT_REGION=us-east-1 \
   -- uvx mcp-proxy-for-aws==1.7.0 https://<id>.lambda-url.us-east-1.on.aws/
 ```
 

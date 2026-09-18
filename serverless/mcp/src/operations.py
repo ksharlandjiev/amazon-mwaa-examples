@@ -228,6 +228,81 @@ def _new_client():
         raise RuntimeError(_client_error_message(e)) from e
 
 
+def _bedrock_region_setting():
+    """The configured Bedrock Region override, if any."""
+    import config
+    return config.get("bedrock_region")
+
+
+def describe_region() -> dict:
+    """The Region every AWS call in this process will go to, and where it came from.
+
+    The client is created once and cached, so the Region is bound for the lifetime of
+    the process. No tool takes a Region argument: to work in another Region you change
+    the environment and restart the server. That is easy to forget and produces
+    confidently wrong answers — an empty workflow list from the wrong Region looks
+    exactly like an empty workflow list from the right one — so it is reported here
+    rather than left to be inferred.
+
+    Note which variable actually works. botocore resolves the session Region from
+    AWS_DEFAULT_REGION only (see botocore/configprovider.py, `'region': ('region',
+    'AWS_DEFAULT_REGION', ...)`). AWS_REGION is ignored, so setting only that leaves
+    the Region coming from the profile — which is why this reports the resolved value
+    and flags the mismatch rather than echoing back what was set.
+    """
+    resolved = boto3.Session().region_name
+    aws_region = os.environ.get("AWS_REGION")
+    default_region = os.environ.get("AWS_DEFAULT_REGION")
+
+    if default_region and resolved == default_region:
+        source = "AWS_DEFAULT_REGION environment variable"
+    elif resolved:
+        profile = os.environ.get("AWS_PROFILE") or "default"
+        source = f"AWS config/credentials profile '{profile}'"
+    else:
+        source = "not configured"
+
+    out = {
+        "effective_region": resolved,
+        "source": source,
+        "fixed_for_process_lifetime": True,
+        "how_to_change": (
+            "Set AWS_DEFAULT_REGION and restart the server. In an MCP client, put it in "
+            "the server's `env` block and restart the client so the server process is "
+            "respawned. Setting AWS_REGION alone has no effect (see ignored_aws_region)."
+        ),
+        "note": (
+            "Every workflow, S3 and CloudWatch Logs call uses this Region. No tool "
+            "accepts a Region argument, so one running server works in one Region."
+        ),
+    }
+
+    if aws_region and aws_region != resolved:
+        out["ignored_aws_region"] = (
+            f"AWS_REGION is set to '{aws_region}' but boto3 resolved '{resolved}'. "
+            f"botocore reads the session Region from AWS_DEFAULT_REGION, not AWS_REGION, "
+            f"so this value is being ignored. Set AWS_DEFAULT_REGION='{aws_region}' if "
+            f"that is the Region you meant."
+        )
+    if not resolved:
+        out["problem"] = (
+            "No Region is configured, so AWS calls will fail with NoRegionError. Set "
+            "AWS_DEFAULT_REGION."
+        )
+        if aws_region:
+            out["problem"] += (
+                f" AWS_REGION='{aws_region}' is set but botocore does not read it."
+            )
+
+    bedrock = _bedrock_region_setting()
+    if bedrock and bedrock != resolved:
+        out["bedrock_region_differs"] = (
+            f"Failure analysis calls Bedrock in {bedrock}, not {resolved}. That is "
+            f"deliberate (BEDROCK_REGION), but it means log content crosses Regions."
+        )
+    return out
+
+
 def _failed_tasks_in_run(workflow_arn: str, run_id: str, limit: int = 20) -> list:
     """Task ids whose log stream ends in final_state=failed.
 

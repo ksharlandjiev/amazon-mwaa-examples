@@ -33,9 +33,11 @@ try:
     # mcp 2.x renamed FastMCP to MCPServer; the surface used here (add_tool, run)
     # is identical, so support whichever version happens to be installed.
     from mcp.server.mcpserver import MCPServer as _Server
+    from mcp.server.mcpserver.exceptions import ToolError
 except ImportError:
     try:
         from mcp.server.fastmcp import FastMCP as _Server
+        from mcp.server.fastmcp.exceptions import ToolError
     except ImportError as exc:  # pragma: no cover
         sys.stderr.write(
             "The 'mcp' package is required for local stdio mode.\n"
@@ -132,6 +134,48 @@ def _tool_registry():
     return app.mcp_server.tools, app.mcp_server.tool_implementations
 
 
+def _reject_unknown_arguments(server):
+    """Make the stdio transport reject unknown tool arguments, as Lambda already does.
+
+    The Lambda handler calls `tool_func(**arguments)`, so a misspelled or unsupported
+    argument raises TypeError and comes back as an error. The stdio library instead
+    validates arguments into a pydantic model whose default `extra` behaviour is
+    "ignore", so unknown keys are silently dropped and the call proceeds.
+
+    That divergence is dangerous for arguments a caller might reasonably expect to
+    exist. `mwaa_list_workflows(region="us-west-2")` returned an empty list from the
+    server's own Region with no error — a confidently wrong answer that no caller can
+    detect. This wraps the tool manager, which sees the raw arguments before they are
+    filtered, so both transports fail the same way.
+    """
+    manager = getattr(server, "_tool_manager", None)
+    if manager is None or not hasattr(manager, "call_tool"):
+        log.warning("Could not install strict argument checking: the stdio server does "
+                    "not expose a tool manager. Unknown arguments will be ignored "
+                    "instead of rejected.")
+        return server
+
+    inner = manager.call_tool
+
+    async def checked_call_tool(name, arguments, *args, **kwargs):
+        tool = manager.get_tool(name)
+        if tool is not None and isinstance(arguments, dict):
+            allowed = set((tool.parameters or {}).get("properties") or {})
+            unknown = sorted(set(arguments) - allowed)
+            if unknown:
+                raise ToolError(
+                    f"{name} does not accept {', '.join(repr(u) for u in unknown)}. "
+                    f"Accepted arguments: {', '.join(sorted(allowed)) or '(none)'}. "
+                    f"Nothing was executed. If you were trying to target another AWS "
+                    f"Region, no tool takes a Region argument — the server uses one "
+                    f"Region fixed at startup; call get_server_config to see it."
+                )
+        return await inner(name, arguments, *args, **kwargs)
+
+    manager.call_tool = checked_call_tool
+    return server
+
+
 def build_server():
     """Register every tool from app.py's registry onto a local stdio server.
 
@@ -162,7 +206,7 @@ def build_server():
             "which means the @mcp_server.tool() decorators did not run."
         )
     log.info("Registered %d tools for local stdio transport", registered)
-    return server
+    return _reject_unknown_arguments(server)
 
 
 def main() -> None:
@@ -174,9 +218,17 @@ def main() -> None:
         log.info("AWS identity: %s (account %s, region %s)",
                  ident.get("Arn", "?"), ident.get("Account", "?"),
                  boto3.Session().region_name or "unset")
-        if not boto3.Session().region_name:
-            log.warning("No AWS region configured. Set AWS_REGION or AWS_DEFAULT_REGION "
-                        "to the region your MWAA Serverless workflows live in.")
+        resolved = boto3.Session().region_name
+        if not resolved:
+            log.warning("No AWS Region configured. Set AWS_DEFAULT_REGION to the Region "
+                        "your MWAA Serverless workflows live in. Note that botocore reads "
+                        "AWS_DEFAULT_REGION, not AWS_REGION.")
+        elif os.environ.get("AWS_REGION") and os.environ["AWS_REGION"] != resolved:
+            log.warning("AWS_REGION=%s is set but boto3 resolved %s; botocore reads the "
+                        "session Region from AWS_DEFAULT_REGION, so AWS_REGION is being "
+                        "ignored. Every call will use %s.",
+                        os.environ["AWS_REGION"], resolved, resolved)
+        log.info("Operating in a single Region for this process: %s", resolved or "unset")
     except Exception as e:
         log.warning("Could not resolve AWS credentials (%s). Authoring and validation "
                     "tools will still work; anything that calls AWS will fail.", e)
