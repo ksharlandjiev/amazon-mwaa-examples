@@ -6,9 +6,74 @@ These application solutions are not supported products in their own right, but e
 
 # MWAA Serverless MCP Server
 
-MCP server on AWS Lambda that helps AI agents author, validate, deploy and debug Amazon MWAA Serverless workflows.
+MCP server that helps AI agents author, validate, deploy and debug Amazon MWAA Serverless workflows. **Runs locally over stdio** as a child process of your MCP client, or deployed to AWS Lambda behind an IAM-authenticated Function URL when a team needs a shared endpoint. Local is the recommended default — see [Running it](#running-it).
 
 Its main job is to stop agents producing DAGs that look plausible and do not run. Every schema rule it enforces was verified against the live `mwaa-serverless` API rather than inferred from documentation, and where the two disagree the verified behaviour is what the server reports.
+
+## Quick start (local)
+
+Local stdio is the recommended way to run this. Every AWS call is made with *your*
+credentials, so the server can do exactly what you can do and nothing more — there is no
+endpoint, no shared role, and CloudTrail attributes every call to you by name.
+
+```bash
+cd serverless/mcp/src
+python3 -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -r requirements-local.txt
+python local_server.py               # optional smoke test; Ctrl-C to stop
+```
+
+Then point your MCP client at it. For Kiro, `~/.kiro/settings/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "mwaa-serverless": {
+      "command": "/abs/path/serverless/mcp/src/.venv/bin/python",
+      "args": ["/abs/path/serverless/mcp/src/local_server.py"],
+      "env": { "AWS_PROFILE": "your-profile", "AWS_DEFAULT_REGION": "us-east-1" }
+    }
+  }
+}
+```
+
+Set `AWS_DEFAULT_REGION`, not `AWS_REGION` — botocore reads only the former, and the
+server works in that one Region until it is restarted. See
+[One Region per running server](#one-region-per-running-server).
+
+Requires Python 3.10+ and `boto3 >= 1.40`. No AWS deployment is involved: `sam build`,
+`sam deploy` and `template.yaml` do not apply in this mode.
+
+Deploying to Lambda is the other option, for when something other than your own machine
+needs to reach the server. It changes the security model substantially — read
+[Running it](#running-it) for the comparison and
+[Security considerations for a remote deployment](#security-considerations-for-a-remote-deployment)
+before doing it. Other clients (Claude Desktop, Claude Code, Cursor) are covered under
+[Client configuration](#client-configuration).
+
+## Contents
+
+- [The YAML schema is not the obvious one](#the-yaml-schema-is-not-the-obvious-one) — the six mistakes that break most DAGs
+- [Passing values between tasks](#passing-values-between-tasks)
+- [Python and Bash operators](#python-and-bash-operators)
+- [Authoring policy: build what was asked for](#authoring-policy-build-what-was-asked-for)
+- [Cost: don't pay for waiting](#cost-dont-pay-for-waiting)
+- [Recommended flow](#recommended-flow)
+- [Where a model is (and is not) involved](#where-a-model-is-and-is-not-involved)
+- [A green run does not mean every task passed](#a-green-run-does-not-mean-every-task-passed)
+- [Tools](#tools)
+- [Configuration](#configuration)
+- [Running it](#running-it) — **local stdio (recommended)** vs deployed Function URL
+- [Security considerations for a remote deployment](#security-considerations-for-a-remote-deployment)
+- [One Region per running server](#one-region-per-running-server)
+- [Client configuration](#client-configuration) — Kiro, Claude Desktop, Claude Code, Cursor
+- [What this sample costs](#what-this-sample-costs)
+- [Cleaning up](#cleaning-up)
+- [Troubleshooting](#troubleshooting)
+- [Quotas](#quotas)
+- [Architecture](#architecture)
+- [Tests](#tests)
 
 ## The YAML schema is not the obvious one
 
