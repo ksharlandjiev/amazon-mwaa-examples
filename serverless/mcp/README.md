@@ -419,21 +419,6 @@ sam delete --stack-name mwaa-serverless-mcp
 | Run says `SUCCESS` but nothing happened | a trailing `all_done` task masked an earlier failure | `mwaa_verify_run_tasks`. |
 | `Invalid tasks configuration` on deploy | `tasks` written as a list | `repair_dag_yaml`, or use `build_dag_yaml`. |
 
-## Quotas
-
-| Resource | Limit |
-|---|---|
-| Workflows per account | 100 |
-| Versions per workflow | 50 |
-| Concurrent runs per account / per workflow | 100 / 20 |
-| XCom value | 100 KB |
-| DAG definition | 50 KB |
-| Code bundle (MWAA service quota) | 250 MB (75 GB per account) |
-| Code bundle passed **inline** to a deployed server | about 4.5 MB. A Lambda request is capped at 6 MB and base64 inflates by a third. Upload to S3 and pass `code_s3_key` instead. No such limit in local stdio mode. |
-| Task execution timeout | 60 minutes |
-| Retries per task | 0–3 |
-| Retry delay | 0–300 seconds |
-
 ## Architecture
 
 ```
@@ -469,7 +454,7 @@ Almost every statement is ARN-scoped to this account and Region. Three actions u
 | `airflow-serverless:CreateWorkflow` | The workflow doesn't exist yet, so there is nothing to name |
 | `logs:DescribeLogGroups` | Enumerates log groups; it doesn't read one |
 
-This was found by deploying, not by linting. Scoped to `workflow/*`, these evaluate to `implicitDeny`, so every name-resolving tool failed with `AccessDeniedException` at run time while `cfn-lint` and `sam build` reported success. A test enforces that the wildcard list stays exactly these three and that nothing destructive joins it.
+Scoped to `workflow/*`, these evaluate to `implicitDeny`, so every name-resolving tool failed with `AccessDeniedException` at run time while `cfn-lint` and `sam build` may report success. A test enforces that the wildcard list stays exactly these three and that nothing destructive joins it.
 
 | Permission | Resource scope |
 |---|---|
