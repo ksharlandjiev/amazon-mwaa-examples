@@ -1599,16 +1599,24 @@ def test_the_readme_recommends_local_first_on_security_grounds():
     assert local < deployed, "local stdio must be presented first"
 
     flat = _readme_flat()
-    intro = flat[flat.index("## Running it"):flat.index("### Option 1 — local stdio")]
-    assert "Run it locally unless you specifically need a shared endpoint" in intro
-    assert "security recommendation" in intro
+    # The Installation section must open by recommending local on security grounds,
+    # before the first option heading.
+    intro = flat[flat.index("## Installation"):flat.index("### Option 1 — local stdio")]
+    assert "Run locally unless you specifically need a shared endpoint" in intro
+    assert "security choice" in intro
+
+
+def _section(readme, heading):
+    """The body of a `## ` section: from its heading to the next `## ` heading."""
+    start = readme.index(heading)
+    rest = readme.find("\n## ", start + len(heading))
+    return readme[start:rest if rest != -1 else len(readme)]
 
 
 def test_the_readme_documents_the_remote_privilege_chain():
     readme = _readme()
     assert "## Security considerations for a remote deployment" in readme
-    section = readme[readme.index("## Security considerations for a remote deployment"):
-                     readme.index("## Client configuration")]
+    section = _section(readme, "## Security considerations for a remote deployment")
     # The chain, link by link.
     for link in ("lambda:InvokeFunctionUrl", "iam:PassRole",
                  "airflow-serverless:CreateWorkflow", "s3:PutObject"):
